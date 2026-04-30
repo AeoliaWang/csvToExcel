@@ -968,9 +968,9 @@ def build_non_empty_row_count_formula(sheet_name, row1, row2, col1, col2):
 
 def build_countif_diff_formula(ranges):
     if not ranges:
-        return '="差分なし"'
+        return '="OK"'
     parts = [f'COUNTIF({rng},"差分あり")' for rng in ranges]
-    return f'=IF(({"+".join(parts)})>0,"差分あり","差分なし")'
+    return f'=IF(({"+".join(parts)})>0,"NG","OK")'
 
 
 def write_summary_sheet(wb, records, sheet_index=0):
@@ -1046,8 +1046,8 @@ def write_summary_sheet(wb, records, sheet_index=0):
         data_check_ref = f"L2:L{ws.max_row}"
         ws.conditional_formatting.add(count_check_ref, CellIsRule(operator="equal", formula=['"差分なし"'], fill=TRUE_FILL))
         ws.conditional_formatting.add(count_check_ref, CellIsRule(operator="equal", formula=['"差分あり"'], fill=FALSE_FILL, font=FALSE_FONT))
-        ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"差分なし"'], fill=TRUE_FILL))
-        ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"差分あり"'], fill=FALSE_FILL, font=FALSE_FONT))
+        ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"OK"'], fill=TRUE_FILL))
+        ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"NG"'], fill=FALSE_FILL, font=FALSE_FONT))
     for r in range(1, ws.max_row + 1):
         ws.row_dimensions[r].height = HEADER_ROW_HEIGHT if r == 1 else BODY_ROW_HEIGHT
     return ws
@@ -1158,7 +1158,40 @@ def normalize_existing_action(value):
     return mapping[text]
 
 
+def normalize_path_value(value):
+    """設定ファイル上のパス表記を正規化する。
+
+    JSON では通常どおり "." / ".." を使えるほか、説明用に
+    「現在フォルダ」「上一层文件夹」などを書いた場合も解釈する。
+    """
+    if value is None:
+        return "."
+    text = str(value).strip()
+    aliases = {
+        "": ".",
+        "現在フォルダ": ".",
+        "現在フォルダー": ".",
+        "カレントフォルダ": ".",
+        "カレントフォルダー": ".",
+        "current": ".",
+        "current_folder": ".",
+        "当前文件夹": ".",
+        "当前目录": ".",
+        "上一层文件夹": "..",
+        "上一層文件夾": "..",
+        "上位フォルダ": "..",
+        "上位フォルダー": "..",
+        "親フォルダ": "..",
+        "親フォルダー": "..",
+        "parent": "..",
+        "parent_folder": "..",
+    }
+    return aliases.get(text, text)
+
+
 def join_if_relative(base, value):
+    value = normalize_path_value(value)
+    base = normalize_path_value(base)
     path = Path(str(value))
     if path.is_absolute():
         return path
@@ -1166,7 +1199,7 @@ def join_if_relative(base, value):
 
 
 def resolve_wildcard_path(folder, filename, must_exist=False):
-    base = Path(str(folder or "."))
+    base = Path(str(normalize_path_value(folder or ".")))
     pattern_path = join_if_relative(base, filename)
     pattern = str(pattern_path)
     if any(ch in pattern for ch in "*?["):
@@ -1180,7 +1213,6 @@ def resolve_wildcard_path(folder, filename, must_exist=False):
     if must_exist and not pattern_path.exists():
         raise FileNotFoundError(f"ファイルが存在しません: {pattern_path}")
     return pattern_path
-
 
 def east_asian_len(value):
     import unicodedata
@@ -1298,8 +1330,23 @@ def main():
     common_cfg = settings.get("共通", {}) if isinstance(settings, dict) else {}
     old_cfg = settings.get("現CSV出力", {}) if isinstance(settings, dict) else {}
 
-    input_base = cfg_get(old_cfg, common_cfg, keys=["入力パス", "入力フォルダパス", "基準パス"], default=".")
-    template_base = cfg_get(old_cfg, common_cfg, keys=["テンプレートパス", "テンプレートフォルダパス"], default=".")
+    # 各インプット/アウトプットは個別に指定できる。
+    # 後方互換のため、未設定時は従来の「入力パス」「テンプレートパス」「出力パス」も読む。
+    before_base = cfg_get(
+        old_cfg, common_cfg,
+        keys=["現_打鍵前入力パス", "現_打鍵前CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"],
+        default=".",
+    )
+    after_base = cfg_get(
+        old_cfg, common_cfg,
+        keys=["現_打鍵後入力パス", "現_打鍵後CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"],
+        default=".",
+    )
+    template_base = cfg_get(
+        old_cfg, common_cfg,
+        keys=["テンプレート入力パス", "テンプレートパス", "テンプレートフォルダパス"],
+        default=".",
+    )
     output_base = cfg_get(old_cfg, common_cfg, keys=["出力パス", "出力フォルダパス"], default=".")
 
     template_name = args.template or cfg_get(old_cfg, keys=["テンプレートファイル名", "テンプレート", "template"], default="テーブル.xlsx")
@@ -1308,8 +1355,8 @@ def main():
     output_name = args.output or cfg_get(old_cfg, keys=["出力ファイル名", "出力ファイル", "output"], default="比較結果.xlsx")
 
     template_path = join_if_relative(template_base, template_name)
-    before_dir = join_if_relative(input_base, before_name)
-    after_dir = join_if_relative(input_base, after_name)
+    before_dir = join_if_relative(before_base, before_name)
+    after_dir = join_if_relative(after_base, after_name)
     output_path = resolve_wildcard_path(output_base, output_name, must_exist=any(ch in str(output_name) for ch in "*?["))
 
     template_sheet = args.template_sheet or cfg_get(old_cfg, keys=["テンプレートシート名", "template_sheet"], default="テーブル")

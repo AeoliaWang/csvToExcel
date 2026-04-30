@@ -869,7 +869,7 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
         ws.cell(row_no, 9).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,3,FALSE),0)'
         ws.cell(row_no, 10).value = f"=I{row_no}-H{row_no}"
         ws.cell(row_no, 11).value = f'=IF(AND(E{row_no}=H{row_no},F{row_no}=I{row_no}),"差分なし","差分あり")'
-        ws.cell(row_no, 12).value = f'=IF(COUNTIF({sheet_ref}!B{block.title_row}:B{block.end_row},"差分あり")>0,"差分あり","差分なし")'
+        ws.cell(row_no, 12).value = f'=IF(COUNTIF({sheet_ref}!B{block.title_row}:B{block.end_row},"差分あり")>0,"NG","OK")'
         ws.cell(row_no, 13).value = note
 
         current_before = _safe_numeric_formula_source(wb[block.sheet_name].cell(block.before_count_row, 3).value)
@@ -916,6 +916,11 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
         fill = SUMMARY_SKIP_FILL
         for c in range(1, max_col + 1):
             ws.cell(r, c).fill = copy(fill)
+
+    if max_row >= 2:
+        data_check_ref = f"L2:L{max_row}"
+        ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"OK"'], fill=TRUE_FILL))
+        ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"NG"'], fill=FALSE_FILL, font=FALSE_FONT))
 
     ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}{max_row}"
     ws.freeze_panes = "A2"
@@ -1033,7 +1038,40 @@ def normalize_existing_action(value):
     return mapping[text]
 
 
+def normalize_path_value(value):
+    """設定ファイル上のパス表記を正規化する。
+
+    JSON では通常どおり "." / ".." を使えるほか、説明用に
+    「現在フォルダ」「上一层文件夹」などを書いた場合も解釈する。
+    """
+    if value is None:
+        return "."
+    text = str(value).strip()
+    aliases = {
+        "": ".",
+        "現在フォルダ": ".",
+        "現在フォルダー": ".",
+        "カレントフォルダ": ".",
+        "カレントフォルダー": ".",
+        "current": ".",
+        "current_folder": ".",
+        "当前文件夹": ".",
+        "当前目录": ".",
+        "上一层文件夹": "..",
+        "上一層文件夾": "..",
+        "上位フォルダ": "..",
+        "上位フォルダー": "..",
+        "親フォルダ": "..",
+        "親フォルダー": "..",
+        "parent": "..",
+        "parent_folder": "..",
+    }
+    return aliases.get(text, text)
+
+
 def join_if_relative(base, value):
+    value = normalize_path_value(value)
+    base = normalize_path_value(base)
     path = Path(str(value))
     if path.is_absolute():
         return path
@@ -1041,7 +1079,7 @@ def join_if_relative(base, value):
 
 
 def resolve_wildcard_path(folder, filename, must_exist=False):
-    base = Path(str(folder or "."))
+    base = Path(str(normalize_path_value(folder or ".")))
     pattern_path = join_if_relative(base, filename)
     pattern = str(pattern_path)
     if any(ch in pattern for ch in "*?["):
@@ -1055,7 +1093,6 @@ def resolve_wildcard_path(folder, filename, must_exist=False):
     if must_exist and not pattern_path.exists():
         raise FileNotFoundError(f"ファイルが存在しません: {pattern_path}")
     return pattern_path
-
 
 def east_asian_len(value):
     import unicodedata
@@ -1231,10 +1268,29 @@ def main():
     common_cfg = settings.get("共通", {}) if isinstance(settings, dict) else {}
     new_cfg = settings.get("新CSV反映", {}) if isinstance(settings, dict) else {}
 
-    input_base = cfg_get(new_cfg, common_cfg, keys=["入力パス", "入力フォルダパス", "基準パス"], default=".")
-    workbook_base = cfg_get(new_cfg, common_cfg, keys=["対象Excelパス", "対象Excelフォルダパス", "出力パス"], default=".")
-    output_base = cfg_get(new_cfg, common_cfg, keys=["出力パス", "出力フォルダパス", "対象Excelパス"], default=".")
-    template_base = cfg_get(new_cfg, common_cfg, keys=["テンプレートパス", "テンプレートフォルダパス"], default=".")
+    # 各インプット/アウトプットは個別に指定できる。
+    # 後方互換のため、未設定時は従来の「入力パス」「対象Excelパス」「出力パス」も読む。
+    before_base = cfg_get(
+        new_cfg, common_cfg,
+        keys=["新_打鍵前入力パス", "新_打鍵前CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"],
+        default=".",
+    )
+    after_base = cfg_get(
+        new_cfg, common_cfg,
+        keys=["新_打鍵後入力パス", "新_打鍵後CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"],
+        default=".",
+    )
+    workbook_base = cfg_get(
+        new_cfg, common_cfg,
+        keys=["対象Excel入力パス", "対象Excelパス", "対象Excelフォルダパス"],
+        default=cfg_get(new_cfg, common_cfg, keys=["出力パス", "出力フォルダパス"], default="."),
+    )
+    template_base = cfg_get(
+        new_cfg, common_cfg,
+        keys=["テンプレート入力パス", "テンプレートパス", "テンプレートフォルダパス"],
+        default=".",
+    )
+    output_base = cfg_get(new_cfg, common_cfg, keys=["出力パス", "出力フォルダパス"], default=workbook_base)
 
     workbook_name = args.workbook or cfg_get(new_cfg, keys=["対象Excelファイル名", "入力Excelファイル名", "workbook"], default="比較結果.xlsx")
     output_name = args.output or cfg_get(new_cfg, keys=["出力ファイル名", "出力ファイル", "output"], default=None)
@@ -1248,8 +1304,8 @@ def main():
         output_path = resolve_wildcard_path(output_base, output_name, must_exist=any(ch in str(output_name) for ch in "*?["))
     else:
         output_path = workbook_path
-    before_dir = join_if_relative(input_base, before_name)
-    after_dir = join_if_relative(input_base, after_name)
+    before_dir = join_if_relative(before_base, before_name)
+    after_dir = join_if_relative(after_base, after_name)
     template_path = join_if_relative(template_base, template_name)
 
     existing_action = normalize_existing_action(cfg_get(new_cfg, common_cfg, keys=["既存ファイル処理", "既存時動作", "existing_action"], default=ACTION_REPLACE_FILE))
