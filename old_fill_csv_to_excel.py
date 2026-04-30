@@ -6,6 +6,7 @@
 
 今回の主な仕様:
 - 現_打鍵前 / 現_打鍵後 の CSV をファイル名で突合する。
+- CSV入力フォルダは複数指定でき、同名CSVは先に指定したフォルダを優先する。
 - 片側にしかない CSV は、存在する側のヘッダーを使い、欠損側は0件扱いにする。
 - CSV 内に「無効な識別」がある場合は、そのCSVを0件扱いにする。
 - 現_打鍵前件数=現_打鍵後件数=0 の表はテーブルシートへ出力せず、テーブル検証 のみに出力する。
@@ -169,10 +170,21 @@ def read_csv_info(path: Path | None) -> CsvInfo:
     return CsvInfo(path=path, header=header, rows=data, exists=True, invalid=invalid)
 
 
-def csv_files(folder: Path):
-    if not folder.exists():
-        raise FileNotFoundError(f"フォルダが存在しません: {folder}")
-    return {p.name.lower(): p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".csv"}
+def csv_files(folder):
+    folders = folder if isinstance(folder, (list, tuple)) else [folder]
+    result = {}
+    for f in folders:
+        f = Path(f)
+        if not f.exists():
+            raise FileNotFoundError(f"フォルダが存在しません: {f}")
+        for p in f.iterdir():
+            if not (p.is_file() and p.suffix.lower() == ".csv"):
+                continue
+            key = p.name.lower()
+            # 同名CSVが複数フォルダにある場合は、先に指定されたフォルダを優先する。
+            if key not in result:
+                result[key] = p
+    return result
 
 
 # ===== template / style =====
@@ -983,6 +995,7 @@ def write_summary_sheet(wb, records, sheet_index=0):
         "CRUD", "出力番号", "出力Sheet", "テーブル名",
         "現_打鍵前件数", "現_打鍵後件数", "現_打鍵前後件数差異",
         "新_打鍵前件数", "新_打鍵後件数", "新_打鍵前後件数差異",
+        "現_打鍵前CSV出处", "現_打鍵後CSV出处",
         "現新件数チェック", "差分チェック", "備考",
     ]
     ws.append(headers)
@@ -1021,6 +1034,8 @@ def write_summary_sheet(wb, records, sheet_index=0):
             new_before_formula,
             new_after_formula,
             f"=I{r_idx}-H{r_idx}",
+            str(rec.before.path) if rec.before.path else "",
+            str(rec.after.path) if rec.after.path else "",
             f'=IF(AND(E{r_idx}=H{r_idx},F{r_idx}=I{r_idx}),"差分なし","差分あり")',
             diff_check_formula,
             " / ".join(rec.notes),
@@ -1031,19 +1046,19 @@ def write_summary_sheet(wb, records, sheet_index=0):
             cell = ws.cell(r_idx, c)
             cell.fill = copy(row_fill)
             cell.font = Font(name=FONT_NAME)
-            cell.alignment = Alignment(vertical="center", wrap_text=(c == len(headers)))
+            cell.alignment = Alignment(vertical="center", wrap_text=(c in {11, 12, len(headers)}))
             cell.border = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
         if rec.crud == "":
             ws.row_dimensions[r_idx].hidden = True
 
-    ws.auto_filter.ref = f"A1:M{max(1, ws.max_row)}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, ws.max_row)}"
     ws.freeze_panes = "A2"
-    widths = [10, 12, 16, 32, 18, 18, 22, 18, 18, 22, 18, 16, 70]
+    widths = [10, 12, 16, 32, 18, 18, 22, 18, 18, 22, 45, 45, 18, 16, 70]
     for i, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
     if ws.max_row >= 2:
-        count_check_ref = f"K2:K{ws.max_row}"
-        data_check_ref = f"L2:L{ws.max_row}"
+        count_check_ref = f"M2:M{ws.max_row}"
+        data_check_ref = f"N2:N{ws.max_row}"
         ws.conditional_formatting.add(count_check_ref, CellIsRule(operator="equal", formula=['"差分なし"'], fill=TRUE_FILL))
         ws.conditional_formatting.add(count_check_ref, CellIsRule(operator="equal", formula=['"差分あり"'], fill=FALSE_FILL, font=FALSE_FONT))
         ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"OK"'], fill=TRUE_FILL))
@@ -1198,6 +1213,96 @@ def join_if_relative(base, value):
     return Path(str(base or ".")) / path
 
 
+
+def _as_ordered_values(value):
+    """設定値を優先順のリストへ変換する。
+
+    JSON 配列のほか、文字列では ; / ； / 改行区切りも利用できる。
+    Windows の C:/... を壊さないため、コロンでは分割しない。
+    """
+    if value is None:
+        return ["."]
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            result.extend(_as_ordered_values(item))
+        return result or ["."]
+    text = str(value).strip()
+    if text == "":
+        return ["."]
+    parts = re.split(r"[;；\r\n]+", text)
+    parts = [p.strip() for p in parts if p and p.strip()]
+    return parts or [text]
+
+
+def _first_ordered_value(value, default=None):
+    values = _as_ordered_values(value)
+    if not values:
+        return default
+    return values[0]
+
+
+def has_any_key(*dicts, keys):
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        for key in keys:
+            if key in d and d[key] not in (None, ""):
+                return True
+    return False
+
+
+def _dedupe_paths(paths):
+    result = []
+    seen = set()
+    for p in paths:
+        p = Path(str(normalize_path_value(p)))
+        try:
+            key = str(p.resolve()) if p.exists() else str(p.absolute())
+        except Exception:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(p)
+    return result
+
+
+def resolve_path_list(path_value):
+    """設定ファイル上のCSVフォルダパスを優先順リストとして解決する。
+
+    例:
+      "現_打鍵前CSVパス": ["優先1/現_打鍵前", "優先2/現_打鍵前"]
+      => 優先1/現_打鍵前, 優先2/現_打鍵前 の順で検索する。
+    """
+    return _dedupe_paths(_as_ordered_values(path_value))
+
+
+def resolve_folder_list(base_value, folder_value):
+    """旧設定互換: 入力パス + フォルダ名を優先順リストとして解決する。"""
+    bases = _as_ordered_values(base_value)
+    folders = _as_ordered_values(folder_value)
+    return _dedupe_paths(join_if_relative(base, folder) for base in bases for folder in folders)
+
+
+def resolve_file_path(path_value, must_exist=False):
+    """設定ファイル上のファイルパスを解決する。ワイルドカードは1件一致のみ許可する。"""
+    raw = _first_ordered_value(path_value, default=".")
+    file_path = Path(str(normalize_path_value(raw)))
+    pattern = str(file_path)
+    if any(ch in pattern for ch in "*?["):
+        parent = file_path.parent if str(file_path.parent) else Path(".")
+        matches = sorted(parent.glob(file_path.name))
+        matches = [m for m in matches if m.is_file()]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise FileNotFoundError(f"ワイルドカードに一致するファイルがありません: {pattern}")
+        raise RuntimeError("ワイルドカードに一致するファイルが複数あります: " + ", ".join(str(m) for m in matches))
+    if must_exist and not file_path.exists():
+        raise FileNotFoundError(f"ファイルが存在しません: {file_path}")
+    return file_path
+
 def resolve_wildcard_path(folder, filename, must_exist=False):
     base = Path(str(normalize_path_value(folder or ".")))
     pattern_path = join_if_relative(base, filename)
@@ -1330,34 +1435,61 @@ def main():
     common_cfg = settings.get("共通", {}) if isinstance(settings, dict) else {}
     old_cfg = settings.get("現CSV出力", {}) if isinstance(settings, dict) else {}
 
-    # 各インプット/アウトプットは個別に指定できる。
-    # 後方互換のため、未設定時は従来の「入力パス」「テンプレートパス」「出力パス」も読む。
-    before_base = cfg_get(
+    # 新形式: パス + フォルダ名/ファイル名を分けず、1項目に完全パスを書く。
+    # 旧形式も互換のため残す。新形式が設定されている場合は新形式を優先する。
+    before_path_value = args.before or cfg_get(
         old_cfg, common_cfg,
-        keys=["現_打鍵前入力パス", "現_打鍵前CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"],
-        default=".",
+        keys=["現_打鍵前CSVパス", "現_打鍵前CSVフォルダ", "現_打鍵前パス", "before_csv_path", "before_path"],
+        default=None,
     )
-    after_base = cfg_get(
+    after_path_value = args.after or cfg_get(
         old_cfg, common_cfg,
-        keys=["現_打鍵後入力パス", "現_打鍵後CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"],
-        default=".",
+        keys=["現_打鍵後CSVパス", "現_打鍵後CSVフォルダ", "現_打鍵後パス", "after_csv_path", "after_path"],
+        default=None,
     )
-    template_base = cfg_get(
+    template_path_value = args.template or cfg_get(
         old_cfg, common_cfg,
-        keys=["テンプレート入力パス", "テンプレートパス", "テンプレートフォルダパス"],
-        default=".",
+        keys=["テンプレートファイルパス", "テンプレートExcelパス", "template_path"],
+        default=None,
     )
-    output_base = cfg_get(old_cfg, common_cfg, keys=["出力パス", "出力フォルダパス"], default=".")
+    if template_path_value is None and not has_any_key(old_cfg, common_cfg, keys=["テンプレート入力パス", "テンプレートフォルダパス"]):
+        template_path_value = cfg_get(old_cfg, keys=["テンプレートファイル", "テンプレート", "template"], default=None)
 
-    template_name = args.template or cfg_get(old_cfg, keys=["テンプレートファイル名", "テンプレート", "template"], default="テーブル.xlsx")
-    before_name = args.before or cfg_get(old_cfg, keys=["現_打鍵前フォルダ名", "before", "before_folder"], default="現_打鍵前")
-    after_name = args.after or cfg_get(old_cfg, keys=["現_打鍵後フォルダ名", "after", "after_folder"], default="現_打鍵後")
-    output_name = args.output or cfg_get(old_cfg, keys=["出力ファイル名", "出力ファイル", "output"], default="比較結果.xlsx")
+    output_path_value = args.output or cfg_get(
+        old_cfg, common_cfg,
+        keys=["出力ファイルパス", "出力Excelパス", "output_path"],
+        default=None,
+    )
+    if output_path_value is None and not has_any_key(old_cfg, common_cfg, keys=["出力パス", "出力フォルダパス"]):
+        output_path_value = cfg_get(old_cfg, keys=["出力ファイル", "output"], default=None)
 
-    template_path = join_if_relative(template_base, template_name)
-    before_dir = join_if_relative(before_base, before_name)
-    after_dir = join_if_relative(after_base, after_name)
-    output_path = resolve_wildcard_path(output_base, output_name, must_exist=any(ch in str(output_name) for ch in "*?["))
+    if before_path_value is not None:
+        before_dir = resolve_path_list(before_path_value)
+    else:
+        before_base = cfg_get(old_cfg, common_cfg, keys=["現_打鍵前入力パス", "現_打鍵前CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"], default=".")
+        before_name = cfg_get(old_cfg, keys=["現_打鍵前フォルダ名", "before", "before_folder"], default="現_打鍵前")
+        before_dir = resolve_folder_list(before_base, before_name)
+
+    if after_path_value is not None:
+        after_dir = resolve_path_list(after_path_value)
+    else:
+        after_base = cfg_get(old_cfg, common_cfg, keys=["現_打鍵後入力パス", "現_打鍵後CSV入力パス", "入力パス", "入力フォルダパス", "基準パス"], default=".")
+        after_name = cfg_get(old_cfg, keys=["現_打鍵後フォルダ名", "after", "after_folder"], default="現_打鍵後")
+        after_dir = resolve_folder_list(after_base, after_name)
+
+    if template_path_value is not None:
+        template_path = resolve_file_path(template_path_value, must_exist=True)
+    else:
+        template_base = cfg_get(old_cfg, common_cfg, keys=["テンプレート入力パス", "テンプレートパス", "テンプレートフォルダパス"], default=".")
+        template_name = cfg_get(old_cfg, keys=["テンプレートファイル名", "テンプレート", "template"], default="テーブル.xlsx")
+        template_path = join_if_relative(template_base, template_name)
+
+    if output_path_value is not None:
+        output_path = resolve_file_path(output_path_value, must_exist=any(ch in str(_first_ordered_value(output_path_value, "")) for ch in "*?["))
+    else:
+        output_base = cfg_get(old_cfg, common_cfg, keys=["出力パス", "出力フォルダパス"], default=".")
+        output_name = cfg_get(old_cfg, keys=["出力ファイル名", "出力ファイル", "output"], default="比較結果.xlsx")
+        output_path = resolve_wildcard_path(output_base, output_name, must_exist=any(ch in str(output_name) for ch in "*?["))
 
     template_sheet = args.template_sheet or cfg_get(old_cfg, keys=["テンプレートシート名", "template_sheet"], default="テーブル")
     sheet_name_arg = args.sheet_name or cfg_get(old_cfg, common_cfg, keys=["テーブルシート名", "sheet_name"], default="テーブル")
