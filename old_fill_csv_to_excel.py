@@ -110,7 +110,8 @@ class TableRecord:
     skip_detail: bool
     output_no: int | None = None
     output_sheet: str = ""
-    extraction_condition: str = ""
+    before_extraction_condition: str = ""
+    after_extraction_condition: str = ""
     detail_refs: dict = field(default_factory=dict)
 
 
@@ -682,8 +683,9 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
     write_static_from_template(tws, ows, 2, r, block_last_col)
     r += 1
     write_static_from_template(tws, ows, 3, r, block_last_col)
-    condition = record.extraction_condition or "抽出条件"
-    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {condition}"
+    before_condition = record.before_extraction_condition or "抽出条件"
+    after_condition = record.after_extraction_condition or "抽出条件"
+    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {before_condition}"
     force_font_name(ows.cell(r, 3))
     r += 1
     write_header_row(tws, ows, 4, r, before_header, col_count, block_last_col, header_rows)
@@ -714,7 +716,7 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
         r += 1
 
     write_static_from_template(tws, ows, layout["after_sql"], r, block_last_col)
-    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {condition}"
+    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {after_condition}"
     force_font_name(ows.cell(r, 3))
     r += 1
     write_header_row(tws, ows, layout["after_header"], r, after_header, col_count, block_last_col, header_rows)
@@ -1426,9 +1428,9 @@ def read_selected_table_names_from_workbook(path: Path, sheet_name, mark_col, ta
             pass
 
 
-def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_col, table_col, condition_col, mark_value="〇"):
-    """出力済みExcelの指定シートから、〇が付いた表名ごとの抽出条件を読む。"""
-    if not sheet_name or not condition_col or path is None or not path.exists():
+def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_col, table_col, before_condition_col, after_condition_col, mark_value="〇"):
+    """出力済みExcelの指定シートから、〇が付いた表名ごとの打鍵前/打鍵後抽出条件を読む。"""
+    if not sheet_name or (not before_condition_col and not after_condition_col) or path is None or not path.exists():
         return {}
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
@@ -1437,7 +1439,8 @@ def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_co
         ws = wb[sheet_name]
         mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
         table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
-        condition_col_idx = column_index_from_config(condition_col, "対象表選択条件列")
+        before_condition_col_idx = column_index_from_config(before_condition_col, "対象表選択打鍵前条件列") if before_condition_col else None
+        after_condition_col_idx = column_index_from_config(after_condition_col, "対象表選択打鍵後条件列") if after_condition_col else None
         expected = "" if mark_value is None else str(mark_value).strip()
         conditions = {}
         for r in range(1, ws.max_row + 1):
@@ -1448,8 +1451,12 @@ def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_co
             key = _normalize_table_key(table_name)
             if not key:
                 continue
-            condition = ws.cell(r, condition_col_idx).value
-            conditions[key] = "" if condition is None else str(condition).strip()
+            before_condition = ws.cell(r, before_condition_col_idx).value if before_condition_col_idx else None
+            after_condition = ws.cell(r, after_condition_col_idx).value if after_condition_col_idx else None
+            conditions[key] = {
+                "before": "" if before_condition is None else str(before_condition).strip(),
+                "after": "" if after_condition is None else str(after_condition).strip(),
+            }
         return conditions
     finally:
         try:
@@ -1472,7 +1479,13 @@ def apply_selected_table_conditions(records, table_conditions):
         aliases = make_table_aliases(record.display_name, record.sql_name, record.key)
         for alias in aliases:
             if alias in table_conditions:
-                record.extraction_condition = table_conditions[alias]
+                conditions = table_conditions[alias]
+                if isinstance(conditions, dict):
+                    record.before_extraction_condition = conditions.get("before", "")
+                    record.after_extraction_condition = conditions.get("after", "")
+                else:
+                    record.before_extraction_condition = str(conditions or "")
+                    record.after_extraction_condition = str(conditions or "")
                 break
 
 
@@ -1716,7 +1729,9 @@ def main():
     selector_sheet = cfg_get(old_cfg, common_cfg, keys=["対象表選択シート名", "選択シート名", "table_selector_sheet"], default=None)
     selector_mark_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択判定列", "選択判定列", "table_selector_mark_column"], default=None)
     selector_table_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択表名列", "選択表名列", "table_selector_table_column"], default=None)
-    selector_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択条件列", "選択条件列", "table_selector_condition_column"], default=None)
+    selector_legacy_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択条件列", "選択条件列", "table_selector_condition_column"], default=None)
+    selector_before_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵前条件列", "打鍵前条件列", "table_selector_before_condition_column"], default=selector_legacy_condition_col)
+    selector_after_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵後条件列", "打鍵後条件列", "table_selector_after_condition_column"], default=selector_legacy_condition_col)
     selector_mark_value = cfg_get(old_cfg, common_cfg, keys=["対象表選択判定値", "選択判定値", "table_selector_mark_value"], default="〇")
 
     if not template_path.exists():
@@ -1746,10 +1761,11 @@ def main():
             selector_sheet,
             selector_mark_col,
             selector_table_col,
-            selector_condition_col,
+            selector_before_condition_col,
+            selector_after_condition_col,
             selector_mark_value,
         )
-        logger.info("対象表選択シート: %s / 判定列: %s / 表名列: %s / 条件列: %s / 判定値: %s", selector_sheet, selector_mark_col, selector_table_col, selector_condition_col, selector_mark_value)
+        logger.info("対象表選択シート: %s / 判定列: %s / 表名列: %s / 打鍵前条件列: %s / 打鍵後条件列: %s / 判定値: %s", selector_sheet, selector_mark_col, selector_table_col, selector_before_condition_col, selector_after_condition_col, selector_mark_value)
         logger.info("対象表選択件数: %s / 抽出条件件数: %s", 0 if selected_table_names is None else len(selected_table_names), len(selected_table_conditions))
 
     template_wb = load_workbook(template_path)
