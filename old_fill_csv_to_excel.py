@@ -6,7 +6,8 @@
 
 今回の主な仕様:
 - 現_打鍵前 / 現_打鍵後 の CSV をファイル名で突合する。
-- CSV入力フォルダは複数指定でき、同名CSVは先に指定したフォルダを優先する。
+- CSV入力フォルダは複数指定でき、同名CSVは先に指定した有効CSVを優先する。
+- 優先フォルダ側のCSVがヘッダーのみ、または「無効な識別」を含む場合は、後続フォルダのCSVを採用する。
 - 片側にしかない CSV は、存在する側のヘッダーを使い、欠損側は0件扱いにする。
 - CSV 内に「無効な識別」がある場合は、そのCSVを0件扱いにする。
 - 現_打鍵前件数=現_打鍵後件数=0 の表はテーブルシートへ出力せず、テーブル検証 のみに出力する。
@@ -25,6 +26,7 @@ import argparse
 import csv
 import json
 import io
+import logging
 import os
 import re
 import tempfile
@@ -34,6 +36,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from copy import copy
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from openpyxl import load_workbook
@@ -107,6 +110,7 @@ class TableRecord:
     skip_detail: bool
     output_no: int | None = None
     output_sheet: str = ""
+    extraction_condition: str = ""
     detail_refs: dict = field(default_factory=dict)
 
 
@@ -170,9 +174,23 @@ def read_csv_info(path: Path | None) -> CsvInfo:
     return CsvInfo(path=path, header=header, rows=data, exists=True, invalid=invalid)
 
 
+def is_effective_csv_info(info: CsvInfo) -> bool:
+    """優先採用できるCSVか判定する。
+
+    条件:
+    - CSVが存在する
+    - 「無効な識別」を含まない
+    - ヘッダー以外のデータ行が1行以上ある
+
+    これを満たさないCSVは、同名CSVの後続候補があれば後続候補へフォールバックする。
+    """
+    return bool(info.exists and not info.invalid and info.count > 0)
+
+
 def csv_files(folder):
     folders = folder if isinstance(folder, (list, tuple)) else [folder]
     result = {}
+    first_bad = {}
     for f in folders:
         f = Path(f)
         if not f.exists():
@@ -181,9 +199,20 @@ def csv_files(folder):
             if not (p.is_file() and p.suffix.lower() == ".csv"):
                 continue
             key = p.name.lower()
-            # 同名CSVが複数フォルダにある場合は、先に指定されたフォルダを優先する。
-            if key not in result:
+            # 有効CSVが既に採用済みなら、低優先フォルダは見ない。
+            if key in result:
+                continue
+
+            info = read_csv_info(p)
+            if is_effective_csv_info(info):
                 result[key] = p
+            else:
+                # ヘッダーのみ/無効な識別などの場合は、後続フォルダの同名CSVを探す。
+                # ただし全候補が無効だった場合に備え、最初の無効候補は保持する。
+                first_bad.setdefault(key, p)
+
+    for key, p in first_bad.items():
+        result.setdefault(key, p)
     return result
 
 
@@ -587,6 +616,10 @@ def build_table_records(before_map, after_map, sql_name_mode):
             notes.append("打鍵前CSVに無効な識別あり。0件扱い")
         if after.invalid:
             notes.append("打鍵後CSVに無効な識別あり。0件扱い")
+        if before.exists and not before.invalid and before.count == 0:
+            notes.append("打鍵前CSVがヘッダーのみ。0件扱い")
+        if after.exists and not after.invalid and after.count == 0:
+            notes.append("打鍵後CSVがヘッダーのみ。0件扱い")
 
         before_header = before.header[:]
         after_header = after.header[:]
@@ -649,7 +682,8 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
     write_static_from_template(tws, ows, 2, r, block_last_col)
     r += 1
     write_static_from_template(tws, ows, 3, r, block_last_col)
-    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE 抽出条件"
+    condition = record.extraction_condition or "抽出条件"
+    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {condition}"
     force_font_name(ows.cell(r, 3))
     r += 1
     write_header_row(tws, ows, 4, r, before_header, col_count, block_last_col, header_rows)
@@ -680,7 +714,7 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
         r += 1
 
     write_static_from_template(tws, ows, layout["after_sql"], r, block_last_col)
-    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE 抽出条件"
+    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {condition}"
     force_font_name(ows.cell(r, 3))
     r += 1
     write_header_row(tws, ows, layout["after_header"], r, after_header, col_count, block_last_col, header_rows)
@@ -1120,6 +1154,26 @@ ACTION_ERROR = "error"
 ACTION_REPLACE_SHEETS = "replace_sheets"
 
 
+def setup_logging(script_name: str):
+    log_dir = Path.cwd() / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"{script_name}_{timestamp}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        force=True,
+    )
+    return logging.getLogger(script_name), log_path
+
+
+def print_and_log(message: str, logger=None):
+    print(message)
+    if logger:
+        logger.info(message)
+
+
 def load_settings_file(config_path: Path | None):
     if config_path is None:
         config_path = Path(DEFAULT_CONFIG_FILE)
@@ -1319,6 +1373,108 @@ def resolve_wildcard_path(folder, filename, must_exist=False):
         raise FileNotFoundError(f"ファイルが存在しません: {pattern_path}")
     return pattern_path
 
+def column_index_from_config(value, label):
+    """設定値の列指定を 1 始まりの列番号へ変換する。例: K / k / K列 / 11。"""
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"{label} が設定されていません。")
+    text = str(value).strip()
+    if text.endswith("列"):
+        text = text[:-1].strip()
+    if text.isdigit():
+        idx = int(text)
+        if idx <= 0:
+            raise ValueError(f"{label} は 1 以上を指定してください: {value}")
+        return idx
+    text = text.upper()
+    if not re.fullmatch(r"[A-Z]+", text):
+        raise ValueError(f"{label} の列指定が不正です: {value}")
+    idx = 0
+    for ch in text:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def read_selected_table_names_from_workbook(path: Path, sheet_name, mark_col, table_col, mark_value="〇"):
+    """出力済みExcelの指定シートから、〇が付いた表名を読む。
+
+    指定シートが存在しない場合は None を返し、呼び出し側はフィルタなしとして扱う。
+    """
+    if not sheet_name or path is None or not path.exists():
+        return None
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return None
+        ws = wb[sheet_name]
+        mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
+        table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
+        expected = "" if mark_value is None else str(mark_value).strip()
+        selected = set()
+        for r in range(1, ws.max_row + 1):
+            mark = ws.cell(r, mark_col_idx).value
+            table_name = ws.cell(r, table_col_idx).value
+            if str(mark).strip() != expected:
+                continue
+            key = _normalize_table_key(table_name)
+            if key:
+                selected.add(key)
+        return selected
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_col, table_col, condition_col, mark_value="〇"):
+    """出力済みExcelの指定シートから、〇が付いた表名ごとの抽出条件を読む。"""
+    if not sheet_name or not condition_col or path is None or not path.exists():
+        return {}
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return {}
+        ws = wb[sheet_name]
+        mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
+        table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
+        condition_col_idx = column_index_from_config(condition_col, "対象表選択条件列")
+        expected = "" if mark_value is None else str(mark_value).strip()
+        conditions = {}
+        for r in range(1, ws.max_row + 1):
+            mark = ws.cell(r, mark_col_idx).value
+            table_name = ws.cell(r, table_col_idx).value
+            if str(mark).strip() != expected:
+                continue
+            key = _normalize_table_key(table_name)
+            if not key:
+                continue
+            condition = ws.cell(r, condition_col_idx).value
+            conditions[key] = "" if condition is None else str(condition).strip()
+        return conditions
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def record_matches_selected_tables(record, selected_table_names):
+    if selected_table_names is None:
+        return True
+    aliases = make_table_aliases(record.display_name, record.sql_name, record.key)
+    return any(alias in selected_table_names for alias in aliases)
+
+
+def apply_selected_table_conditions(records, table_conditions):
+    if not table_conditions:
+        return
+    for record in records:
+        aliases = make_table_aliases(record.display_name, record.sql_name, record.key)
+        for alias in aliases:
+            if alias in table_conditions:
+                record.extraction_condition = table_conditions[alias]
+                break
+
 def east_asian_len(value):
     import unicodedata
     text = "" if value is None else str(value)
@@ -1430,6 +1586,10 @@ def main():
     parser.add_argument("--sql-name-mode", choices=["stem", "filename"], default=None, help="SQL の FROM に使う名前")
     parser.add_argument("--tables-per-sheet", type=int, default=None, help="1シートに出力するテーブル数。既定値は5。")
     args = parser.parse_args()
+    logger, log_path = setup_logging(Path(__file__).stem)
+    logger.info("処理開始")
+    logger.info("ログファイル: %s", log_path)
+    logger.info("設定ファイル: %s", args.config)
 
     settings = load_settings_file(Path(args.config) if args.config else None)
     common_cfg = settings.get("共通", {}) if isinstance(settings, dict) else {}
@@ -1502,11 +1662,45 @@ def main():
     auto_width_enabled = bool_value(cfg_get(old_cfg, common_cfg, keys=["列幅自動調整", "自動列幅調整", "auto_fit_columns"], default=False))
     max_width = cfg_get(old_cfg, common_cfg, keys=["最大列幅", "max_column_width"], default=60)
     min_width = cfg_get(old_cfg, common_cfg, keys=["最小列幅", "min_column_width"], default=8)
+    selector_enabled = bool_value(cfg_get(old_cfg, common_cfg, keys=["対象表選択有効", "対象表選択を使用", "enable_table_selector"], default=False))
+    selector_sheet = cfg_get(old_cfg, common_cfg, keys=["対象表選択シート名", "選択シート名", "table_selector_sheet"], default=None)
+    selector_mark_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択判定列", "選択判定列", "table_selector_mark_column"], default=None)
+    selector_table_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択表名列", "選択表名列", "table_selector_table_column"], default=None)
+    selector_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択条件列", "選択条件列", "table_selector_condition_column"], default=None)
+    selector_mark_value = cfg_get(old_cfg, common_cfg, keys=["対象表選択判定値", "選択判定値", "table_selector_mark_value"], default="〇")
 
     if not template_path.exists():
         raise FileNotFoundError(f"テンプレート Excel が存在しません: {template_path}")
     if output_path.exists() and existing_action == ACTION_ERROR:
         raise FileExistsError(f"出力ファイルが既に存在します: {output_path}")
+
+    logger.info("現_打鍵前CSVパス: %s", [str(p) for p in before_dir])
+    logger.info("現_打鍵後CSVパス: %s", [str(p) for p in after_dir])
+    logger.info("テンプレートファイル: %s", template_path)
+    logger.info("出力ファイル: %s", output_path)
+    logger.info("既存ファイル処理: %s", existing_action)
+    logger.info("対象表選択有効: %s", selector_enabled)
+
+    selected_table_names = None
+    selected_table_conditions = {}
+    if selector_enabled:
+        selected_table_names = read_selected_table_names_from_workbook(
+            output_path,
+            selector_sheet,
+            selector_mark_col,
+            selector_table_col,
+            selector_mark_value,
+        )
+        selected_table_conditions = read_selected_table_conditions_from_workbook(
+            output_path,
+            selector_sheet,
+            selector_mark_col,
+            selector_table_col,
+            selector_condition_col,
+            selector_mark_value,
+        )
+        logger.info("対象表選択シート: %s / 判定列: %s / 表名列: %s / 条件列: %s / 判定値: %s", selector_sheet, selector_mark_col, selector_table_col, selector_condition_col, selector_mark_value)
+        logger.info("対象表選択件数: %s / 抽出条件件数: %s", 0 if selected_table_names is None else len(selected_table_names), len(selected_table_conditions))
 
     template_wb = load_workbook(template_path)
     compare_exclusions = read_compare_exclusions(template_wb)
@@ -1518,6 +1712,11 @@ def main():
     layout = template_layout(tws)
 
     records = build_table_records(csv_files(before_dir), csv_files(after_dir), sql_name_mode)
+    logger.info("CSV突合テーブル数: %s", len(records))
+    if selected_table_names is not None:
+        records = [rec for rec in records if record_matches_selected_tables(rec, selected_table_names)]
+        apply_selected_table_conditions(records, selected_table_conditions)
+        logger.info("対象表選択後テーブル数: %s", len(records))
     if not records:
         raise RuntimeError("CSVファイルが見つかりません。")
     output_records = assign_output_positions(records, sheet_name_arg, tables_per_sheet)
@@ -1590,8 +1789,16 @@ def main():
 
     save_workbook_atomic(wb, output_path)
     inject_x14_conditional_formatting(output_path, template_path, table_sheet_targets, layout, tws.title)
-    print(f"出力しました: {output_path} / summary={SUMMARY_SHEET_NAME} / mode={existing_action}")
+    print_and_log(f"出力しました: {output_path} / summary={SUMMARY_SHEET_NAME} / mode={existing_action}", logger)
+    print_and_log(f"ログファイル: {log_path}", logger)
+    if selected_table_names is not None:
+        print_and_log(f"対象表選択: {len(selected_table_names)}件指定 / {len(records)}件出力", logger)
+    logger.info("処理終了")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("処理中にエラーが発生しました。")
+        raise

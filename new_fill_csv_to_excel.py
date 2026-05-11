@@ -14,7 +14,8 @@
 注意:
 - 既存の明細行数を前提に転記するため、CSV行数が明細シート上の「新」欄より多い場合、
   明細表示は収まる分だけ転記し、件数はヘルパーシート経由で CSV の実件数を計算式参照する。
-- CSV入力フォルダは複数指定でき、同名CSVは先に指定したフォルダを優先する。
+- CSV入力フォルダは複数指定でき、同名CSVは先に指定した有効CSVを優先する。
+- 優先フォルダ側のCSVがヘッダーのみ、または「無効な識別」を含む場合は、後続フォルダのCSVを採用する。
 - 既存 Excel 内に残っている x14 条件付き書式は保存前に退避し、保存後に再注入する。
 """
 
@@ -22,6 +23,7 @@ import argparse
 import csv
 import json
 import io
+import logging
 import os
 import re
 import tempfile
@@ -30,6 +32,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from copy import copy
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from openpyxl import load_workbook
@@ -195,18 +198,52 @@ def read_csv_info(path: Path | None) -> CsvInfo:
     return CsvInfo(path=path, header=header, rows=data, exists=True, invalid=invalid)
 
 
+def is_effective_csv_info(info: CsvInfo) -> bool:
+    """優先採用できるCSVか判定する。
+
+    条件:
+    - CSVが存在する
+    - 「無効な識別」を含まない
+    - ヘッダー以外のデータ行が1行以上ある
+
+    これを満たさないCSVは、同名CSVの後続候補があれば後続候補へフォールバックする。
+    """
+    return bool(info.exists and not info.invalid and info.count > 0)
+
+
 def csv_files(folder) -> dict[str, Path]:
     folders = folder if isinstance(folder, (list, tuple)) else [folder]
     result: dict[str, Path] = {}
+    first_bad: dict[str, Path] = {}
+
+    def register_bad(key: str, path: Path):
+        first_bad.setdefault(key, path)
+
     for f in folders:
         f = Path(f)
         if not f.exists():
             raise FileNotFoundError(f"フォルダが存在しません: {f}")
         for p in f.iterdir():
-            if p.is_file() and p.suffix.lower() == ".csv":
-                # 同名CSVが複数フォルダにある場合は、先に指定されたフォルダを優先する。
-                result.setdefault(p.stem.lower(), p)
-                result.setdefault(p.name.lower(), p)
+            if not (p.is_file() and p.suffix.lower() == ".csv"):
+                continue
+
+            keys = [p.stem.lower(), p.name.lower()]
+            # stem/name のどちらかで有効CSVが採用済みなら、このファイルは低優先候補なのでスキップ。
+            if all(key in result for key in keys):
+                continue
+
+            info = read_csv_info(p)
+            if is_effective_csv_info(info):
+                for key in keys:
+                    result.setdefault(key, p)
+            else:
+                # ヘッダーのみ/無効な識別などの場合は、後続フォルダの同名CSVを探す。
+                # ただし全候補が無効だった場合に備え、最初の無効候補は保持する。
+                for key in keys:
+                    register_bad(key, p)
+
+    for key, p in first_bad.items():
+        result.setdefault(key, p)
     return result
 
 
@@ -694,6 +731,8 @@ def fill_new_section(ws, section: Section, info: CsvInfo, data_last_col: int) ->
         notes.append("CSVに無効な識別あり。0件扱い")
     if not info.exists:
         notes.append("CSVなし。0件扱い")
+    if info.exists and not info.invalid and info.count == 0:
+        notes.append("CSVがヘッダーのみ。0件扱い")
     if len(actual_rows) > display_rows:
         notes.append(f"CSV件数{len(actual_rows)}件のうち、明細欄に収まる{display_rows}件のみ転記")
 
@@ -978,6 +1017,10 @@ def make_helper_rows(blocks: list[TableBlock], before_map: dict[str, Path], afte
             notes.append("新_打鍵前CSVに無効な識別あり。0件扱い")
         if after_info.invalid:
             notes.append("新_打鍵後CSVに無効な識別あり。0件扱い")
+        if before_info.exists and not before_info.invalid and before_info.count == 0:
+            notes.append("新_打鍵前CSVがヘッダーのみ。0件扱い")
+        if after_info.exists and not after_info.invalid and after_info.count == 0:
+            notes.append("新_打鍵後CSVがヘッダーのみ。0件扱い")
         if res:
             notes.extend(res.notes)
         rows.append({
@@ -997,6 +1040,26 @@ DEFAULT_CONFIG_FILE = "設定ファイル.json"
 ACTION_REPLACE_FILE = "replace_file"
 ACTION_ERROR = "error"
 ACTION_REPLACE_SHEETS = "replace_sheets"
+
+
+def setup_logging(script_name: str):
+    log_dir = Path.cwd() / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"{script_name}_{timestamp}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        force=True,
+    )
+    return logging.getLogger(script_name), log_path
+
+
+def print_and_log(message: str, logger=None):
+    print(message)
+    if logger:
+        logger.info(message)
 
 
 def load_settings_file(config_path: Path | None):
@@ -1198,6 +1261,65 @@ def resolve_wildcard_path(folder, filename, must_exist=False):
         raise FileNotFoundError(f"ファイルが存在しません: {pattern_path}")
     return pattern_path
 
+def column_index_from_config(value, label):
+    """設定値の列指定を 1 始まりの列番号へ変換する。例: K / k / K列 / 11。"""
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"{label} が設定されていません。")
+    text = str(value).strip()
+    if text.endswith("列"):
+        text = text[:-1].strip()
+    if text.isdigit():
+        idx = int(text)
+        if idx <= 0:
+            raise ValueError(f"{label} は 1 以上を指定してください: {value}")
+        return idx
+    text = text.upper()
+    if not re.fullmatch(r"[A-Z]+", text):
+        raise ValueError(f"{label} の列指定が不正です: {value}")
+    idx = 0
+    for ch in text:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def read_selected_table_names_from_workbook(path: Path, sheet_name, mark_col, table_col, mark_value="〇"):
+    """出力済みExcelの指定シートから、〇が付いた表名を読む。
+
+    指定シートが存在しない場合は None を返し、呼び出し側はフィルタなしとして扱う。
+    """
+    if not sheet_name or path is None or not path.exists():
+        return None
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return None
+        ws = wb[sheet_name]
+        mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
+        table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
+        expected = "" if mark_value is None else str(mark_value).strip()
+        selected = set()
+        for r in range(1, ws.max_row + 1):
+            mark = ws.cell(r, mark_col_idx).value
+            table_name = ws.cell(r, table_col_idx).value
+            if str(mark).strip() != expected:
+                continue
+            key = _normalize_table_key(table_name)
+            if key:
+                selected.add(key)
+        return selected
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def block_matches_selected_tables(block: TableBlock, selected_table_names):
+    if selected_table_names is None:
+        return True
+    aliases = make_table_aliases(block.table_name)
+    return any(alias in selected_table_names for alias in aliases)
+
 def east_asian_len(value):
     import unicodedata
     text = "" if value is None else str(value)
@@ -1265,7 +1387,7 @@ def auto_fit_column_widths(wb, enabled=False, max_width=60, min_width=8, sheet_n
                 width = max_len * 1.08 + 1.5
                 ws.column_dimensions[get_column_letter(col)].width = min(max_width, max(min_width, width))
 
-def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path, table_sheet_prefix: str, template_path: Path | None = None, auto_width=False, max_width=60, min_width=8):
+def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path, table_sheet_prefix: str, template_path: Path | None = None, auto_width=False, max_width=60, min_width=8, selected_table_names=None):
     if not workbook_path.exists():
         raise FileNotFoundError(f"Excelファイルが存在しません: {workbook_path}")
 
@@ -1280,6 +1402,8 @@ def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path,
         compare_exclusions = read_compare_exclusions(wb)
     existing_notes = collect_existing_summary_notes(wb)
     blocks = discover_table_blocks(wb, table_sheet_prefix)
+    if selected_table_names is not None:
+        blocks = [block for block in blocks if block_matches_selected_tables(block, selected_table_names)]
     if not blocks:
         raise RuntimeError("テーブル明細ブロックが見つかりません。シート名・タイトル行を確認してください。")
 
@@ -1367,6 +1491,10 @@ def main():
     parser.add_argument("--table-sheet-prefix", default=None, help="明細シート名の接頭辞。既定: テーブル")
     parser.add_argument("--template", default=None, help="比較対象外項目定義を読むテンプレート Excel。既定: テーブル.xlsx")
     args = parser.parse_args()
+    logger, log_path = setup_logging(Path(__file__).stem)
+    logger.info("処理開始")
+    logger.info("ログファイル: %s", log_path)
+    logger.info("設定ファイル: %s", args.config)
 
     settings = load_settings_file(Path(args.config) if args.config else None)
     common_cfg = settings.get("共通", {}) if isinstance(settings, dict) else {}
@@ -1457,6 +1585,29 @@ def main():
     auto_width_enabled = bool_value(cfg_get(new_cfg, common_cfg, keys=["列幅自動調整", "自動列幅調整", "auto_fit_columns"], default=False))
     max_width = cfg_get(new_cfg, common_cfg, keys=["最大列幅", "max_column_width"], default=60)
     min_width = cfg_get(new_cfg, common_cfg, keys=["最小列幅", "min_column_width"], default=8)
+    selector_enabled = bool_value(cfg_get(new_cfg, common_cfg, keys=["対象表選択有効", "対象表選択を使用", "enable_table_selector"], default=False))
+    selector_sheet = cfg_get(new_cfg, common_cfg, keys=["対象表選択シート名", "選択シート名", "table_selector_sheet"], default=None)
+    selector_mark_col = cfg_get(new_cfg, common_cfg, keys=["対象表選択判定列", "選択判定列", "table_selector_mark_column"], default=None)
+    selector_table_col = cfg_get(new_cfg, common_cfg, keys=["対象表選択表名列", "選択表名列", "table_selector_table_column"], default=None)
+    selector_mark_value = cfg_get(new_cfg, common_cfg, keys=["対象表選択判定値", "選択判定値", "table_selector_mark_value"], default="〇")
+    logger.info("新_打鍵前CSVパス: %s", [str(p) for p in before_dir])
+    logger.info("新_打鍵後CSVパス: %s", [str(p) for p in after_dir])
+    logger.info("対象Excelファイル: %s", workbook_path)
+    logger.info("テンプレートファイル: %s", template_path)
+    logger.info("出力ファイル: %s", output_path)
+    logger.info("既存ファイル処理: %s", existing_action)
+    logger.info("対象表選択有効: %s", selector_enabled)
+    selected_table_names = None
+    if selector_enabled:
+        selected_table_names = read_selected_table_names_from_workbook(
+            output_path,
+            selector_sheet,
+            selector_mark_col,
+            selector_table_col,
+            selector_mark_value,
+        )
+        logger.info("対象表選択シート: %s / 判定列: %s / 表名列: %s / 判定値: %s", selector_sheet, selector_mark_col, selector_table_col, selector_mark_value)
+        logger.info("対象表選択件数: %s", 0 if selected_table_names is None else len(selected_table_names))
 
     blocks, helper_rows = fill_workbook(
         workbook_path=workbook_path,
@@ -1468,12 +1619,21 @@ def main():
         auto_width=auto_width_enabled,
         max_width=max_width,
         min_width=min_width,
+        selected_table_names=selected_table_names,
     )
 
-    print(f"出力しました: {output_path} / mode={existing_action}")
-    print(f"明細更新テーブル数: {len(blocks)}")
-    print(f"新CSV検証件数: {len(helper_rows)}")
+    print_and_log(f"出力しました: {output_path} / mode={existing_action}", logger)
+    print_and_log(f"明細更新テーブル数: {len(blocks)}", logger)
+    print_and_log(f"新CSV検証件数: {len(helper_rows)}", logger)
+    print_and_log(f"ログファイル: {log_path}", logger)
+    if selected_table_names is not None:
+        print_and_log(f"対象表選択: {len(selected_table_names)}件指定 / {len(blocks)}件更新", logger)
+    logger.info("処理終了")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("処理中にエラーが発生しました。")
+        raise
