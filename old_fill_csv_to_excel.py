@@ -1475,6 +1475,56 @@ def apply_selected_table_conditions(records, table_conditions):
                 record.extraction_condition = table_conditions[alias]
                 break
 
+
+def table_aliases_with_csv_data_from_records(records):
+    aliases = set()
+    for record in records:
+        if record.before.count <= 0 and record.after.count <= 0:
+            continue
+        aliases.update(make_table_aliases(record.display_name, record.sql_name, record.key))
+    return aliases
+
+
+def find_or_create_selector_result_col(ws, header_name="CSVデータ不一致"):
+    for c in range(1, ws.max_column + 1):
+        if str(ws.cell(1, c).value or "").strip() == header_name:
+            return c
+    col = ws.max_column + 1
+    ws.cell(1, col).value = header_name
+    ws.cell(1, col).font = Font(name=FONT_NAME, bold=True)
+    ws.cell(1, col).alignment = Alignment(horizontal="center", vertical="center")
+    ws.column_dimensions[get_column_letter(col)].width = max(ws.column_dimensions[get_column_letter(col)].width or 0, 28)
+    return col
+
+
+def mark_selector_csv_mismatches(wb, sheet_name, mark_col, table_col, mark_value, data_table_aliases):
+    if not sheet_name or sheet_name not in wb.sheetnames:
+        return 0
+    ws = wb[sheet_name]
+    mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
+    table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
+    result_col_idx = find_or_create_selector_result_col(ws)
+    expected = "" if mark_value is None else str(mark_value).strip()
+    mismatch_count = 0
+    for r in range(2, ws.max_row + 1):
+        table_name = ws.cell(r, table_col_idx).value
+        table_key = _normalize_table_key(table_name)
+        if not table_key:
+            ws.cell(r, result_col_idx).value = None
+            continue
+        selected = str(ws.cell(r, mark_col_idx).value).strip() == expected
+        has_csv_data = table_key in data_table_aliases
+        result = ""
+        if selected and not has_csv_data:
+            result = "選択あり/CSVデータなし"
+        elif not selected and has_csv_data:
+            result = "CSVデータあり/選択なし"
+        ws.cell(r, result_col_idx).value = result
+        force_font_name(ws.cell(r, result_col_idx))
+        if result:
+            mismatch_count += 1
+    return mismatch_count
+
 def east_asian_len(value):
     import unicodedata
     text = "" if value is None else str(value)
@@ -1712,7 +1762,9 @@ def main():
     layout = template_layout(tws)
 
     records = build_table_records(csv_files(before_dir), csv_files(after_dir), sql_name_mode)
+    data_table_aliases = table_aliases_with_csv_data_from_records(records)
     logger.info("CSV突合テーブル数: %s", len(records))
+    logger.info("CSVデータありテーブル数(alias含む): %s", len(data_table_aliases))
     if selected_table_names is not None:
         records = [rec for rec in records if record_matches_selected_tables(rec, selected_table_names)]
         apply_selected_table_conditions(records, selected_table_conditions)
@@ -1772,6 +1824,17 @@ def main():
 
     for ws, sheet_name in table_sheets_to_rename:
         ws.title = sheet_name
+
+    if selector_enabled:
+        mismatch_count = mark_selector_csv_mismatches(
+            wb,
+            selector_sheet,
+            selector_mark_col,
+            selector_table_col,
+            selector_mark_value,
+            data_table_aliases,
+        )
+        logger.info("対象表選択CSV不一致件数: %s", mismatch_count)
 
     auto_fit_column_widths(
         wb,

@@ -1320,6 +1320,60 @@ def block_matches_selected_tables(block: TableBlock, selected_table_names):
     aliases = make_table_aliases(block.table_name)
     return any(alias in selected_table_names for alias in aliases)
 
+
+def table_aliases_with_csv_data(before_map: dict[str, Path], after_map: dict[str, Path]):
+    aliases = set()
+    for key in sorted(set(before_map.keys()) | set(after_map.keys())):
+        before_info = read_csv_info(before_map.get(key))
+        after_info = read_csv_info(after_map.get(key))
+        if before_info.count <= 0 and after_info.count <= 0:
+            continue
+        display_path = before_info.path or after_info.path
+        display_name = display_path.stem if display_path else key[:-4] if key.lower().endswith(".csv") else key
+        aliases.update(make_table_aliases(display_name, key))
+    return aliases
+
+
+def find_or_create_selector_result_col(ws, header_name="CSVデータ不一致"):
+    for c in range(1, ws.max_column + 1):
+        if str(ws.cell(1, c).value or "").strip() == header_name:
+            return c
+    col = ws.max_column + 1
+    ws.cell(1, col).value = header_name
+    ws.cell(1, col).font = Font(name=FONT_NAME, bold=True)
+    ws.cell(1, col).alignment = Alignment(horizontal="center", vertical="center")
+    ws.column_dimensions[get_column_letter(col)].width = max(ws.column_dimensions[get_column_letter(col)].width or 0, 28)
+    return col
+
+
+def mark_selector_csv_mismatches(wb, sheet_name, mark_col, table_col, mark_value, data_table_aliases):
+    if not sheet_name or sheet_name not in wb.sheetnames:
+        return 0
+    ws = wb[sheet_name]
+    mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
+    table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
+    result_col_idx = find_or_create_selector_result_col(ws)
+    expected = "" if mark_value is None else str(mark_value).strip()
+    mismatch_count = 0
+    for r in range(2, ws.max_row + 1):
+        table_name = ws.cell(r, table_col_idx).value
+        table_key = _normalize_table_key(table_name)
+        if not table_key:
+            ws.cell(r, result_col_idx).value = None
+            continue
+        selected = str(ws.cell(r, mark_col_idx).value).strip() == expected
+        has_csv_data = table_key in data_table_aliases
+        result = ""
+        if selected and not has_csv_data:
+            result = "選択あり/CSVデータなし"
+        elif not selected and has_csv_data:
+            result = "CSVデータあり/選択なし"
+        ws.cell(r, result_col_idx).value = result
+        force_font_name(ws.cell(r, result_col_idx))
+        if result:
+            mismatch_count += 1
+    return mismatch_count
+
 def east_asian_len(value):
     import unicodedata
     text = "" if value is None else str(value)
@@ -1387,12 +1441,13 @@ def auto_fit_column_widths(wb, enabled=False, max_width=60, min_width=8, sheet_n
                 width = max_len * 1.08 + 1.5
                 ws.column_dimensions[get_column_letter(col)].width = min(max_width, max(min_width, width))
 
-def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path, table_sheet_prefix: str, template_path: Path | None = None, auto_width=False, max_width=60, min_width=8, selected_table_names=None):
+def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path, table_sheet_prefix: str, template_path: Path | None = None, auto_width=False, max_width=60, min_width=8, selected_table_names=None, selector_info=None):
     if not workbook_path.exists():
         raise FileNotFoundError(f"Excelファイルが存在しません: {workbook_path}")
 
     before_map = csv_files(before_dir)
     after_map = csv_files(after_dir)
+    data_table_aliases = table_aliases_with_csv_data(before_map, after_map)
 
     preserved_ext = extract_extlst_by_sheet(workbook_path)
     compare_exclusions = read_compare_exclusions_from_path(template_path)
@@ -1455,6 +1510,17 @@ def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path,
 
     auto_fit_column_widths(wb, enabled=auto_width, max_width=max_width, min_width=min_width, sheet_names=[ws.title for ws in wb.worksheets if is_table_sheet_name(ws.title, table_sheet_prefix) or ws.title in {SUMMARY_SHEET_NAME, HELPER_SHEET_NAME}])
 
+    mismatch_count = None
+    if selector_info:
+        mismatch_count = mark_selector_csv_mismatches(
+            wb,
+            selector_info.get("sheet_name"),
+            selector_info.get("mark_col"),
+            selector_info.get("table_col"),
+            selector_info.get("mark_value"),
+            data_table_aliases,
+        )
+
     try:
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
@@ -1478,7 +1544,7 @@ def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path,
     # x14 条件付き書式を可能な限り復元する
     reinject_extlst_by_sheet(output_path, preserved_ext)
 
-    return blocks, helper_rows
+    return blocks, helper_rows, mismatch_count
 
 
 def main():
@@ -1609,7 +1675,16 @@ def main():
         logger.info("対象表選択シート: %s / 判定列: %s / 表名列: %s / 判定値: %s", selector_sheet, selector_mark_col, selector_table_col, selector_mark_value)
         logger.info("対象表選択件数: %s", 0 if selected_table_names is None else len(selected_table_names))
 
-    blocks, helper_rows = fill_workbook(
+    selector_info = None
+    if selector_enabled:
+        selector_info = {
+            "sheet_name": selector_sheet,
+            "mark_col": selector_mark_col,
+            "table_col": selector_table_col,
+            "mark_value": selector_mark_value,
+        }
+
+    blocks, helper_rows, mismatch_count = fill_workbook(
         workbook_path=workbook_path,
         before_dir=before_dir,
         after_dir=after_dir,
@@ -1620,11 +1695,14 @@ def main():
         max_width=max_width,
         min_width=min_width,
         selected_table_names=selected_table_names,
+        selector_info=selector_info,
     )
 
     print_and_log(f"出力しました: {output_path} / mode={existing_action}", logger)
     print_and_log(f"明細更新テーブル数: {len(blocks)}", logger)
     print_and_log(f"新CSV検証件数: {len(helper_rows)}", logger)
+    if mismatch_count is not None:
+        print_and_log(f"対象表選択CSV不一致件数: {mismatch_count}", logger)
     print_and_log(f"ログファイル: {log_path}", logger)
     if selected_table_names is not None:
         print_and_log(f"対象表選択: {len(selected_table_names)}件指定 / {len(blocks)}件更新", logger)
