@@ -7,7 +7,8 @@
 今回の主な仕様:
 - 現_打鍵前 / 現_打鍵後 の CSV をファイル名で突合する。
 - CSV入力フォルダは複数指定でき、同名CSVは先に指定した有効CSVを優先する。
-- 優先フォルダ側のCSVがヘッダーのみ、または「無効な識別」を含む場合は、後続フォルダのCSVを採用する。
+- 優先フォルダ側のCSVが存在し「無効な識別」を含まない場合は、ヘッダーのみでも採用する。
+- 「無効な識別」を含む場合のみ、後続フォルダの同名CSVを採用する。
 - 片側にしかない CSV は、存在する側のヘッダーを使い、欠損側は0件扱いにする。
 - CSV 内に「無効な識別」がある場合は、そのCSVを0件扱いにする。
 - 現_打鍵前件数=現_打鍵後件数=0 の表はテーブルシートへ出力せず、テーブル検証 のみに出力する。
@@ -181,11 +182,10 @@ def is_effective_csv_info(info: CsvInfo) -> bool:
     条件:
     - CSVが存在する
     - 「無効な識別」を含まない
-    - ヘッダー以外のデータ行が1行以上ある
 
-    これを満たさないCSVは、同名CSVの後続候補があれば後続候補へフォールバックする。
+    ヘッダーのみでも採用し、無効な識別を含む場合だけ後続候補へフォールバックする。
     """
-    return bool(info.exists and not info.invalid and info.count > 0)
+    return bool(info.exists and not info.invalid)
 
 
 def csv_files(folder):
@@ -208,7 +208,7 @@ def csv_files(folder):
             if is_effective_csv_info(info):
                 result[key] = p
             else:
-                # ヘッダーのみ/無効な識別などの場合は、後続フォルダの同名CSVを探す。
+                # 無効な識別などの場合は、後続フォルダの同名CSVを探す。
                 # ただし全候補が無効だった場合に備え、最初の無効候補は保持する。
                 first_bad.setdefault(key, p)
 

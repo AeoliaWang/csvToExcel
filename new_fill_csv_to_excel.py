@@ -15,7 +15,8 @@
 - 既存の明細行数を前提に転記するため、CSV行数が明細シート上の「新」欄より多い場合、
   明細表示は収まる分だけ転記し、件数はヘルパーシート経由で CSV の実件数を計算式参照する。
 - CSV入力フォルダは複数指定でき、同名CSVは先に指定した有効CSVを優先する。
-- 優先フォルダ側のCSVがヘッダーのみ、または「無効な識別」を含む場合は、後続フォルダのCSVを採用する。
+- 優先フォルダ側のCSVが存在し「無効な識別」を含まない場合は、ヘッダーのみでも採用する。
+- 「無効な識別」を含む場合のみ、後続フォルダの同名CSVを採用する。
 - 既存 Excel 内に残っている x14 条件付き書式は保存前に退避し、保存後に再注入する。
 """
 
@@ -204,11 +205,10 @@ def is_effective_csv_info(info: CsvInfo) -> bool:
     条件:
     - CSVが存在する
     - 「無効な識別」を含まない
-    - ヘッダー以外のデータ行が1行以上ある
 
-    これを満たさないCSVは、同名CSVの後続候補があれば後続候補へフォールバックする。
+    ヘッダーのみでも採用し、無効な識別を含む場合だけ後続候補へフォールバックする。
     """
-    return bool(info.exists and not info.invalid and info.count > 0)
+    return bool(info.exists and not info.invalid)
 
 
 def csv_files(folder) -> dict[str, Path]:
@@ -237,7 +237,7 @@ def csv_files(folder) -> dict[str, Path]:
                 for key in keys:
                     result.setdefault(key, p)
             else:
-                # ヘッダーのみ/無効な識別などの場合は、後続フォルダの同名CSVを探す。
+                # 無効な識別などの場合は、後続フォルダの同名CSVを探す。
                 # ただし全候補が無効だった場合に備え、最初の無効候補は保持する。
                 for key in keys:
                     register_bad(key, p)
