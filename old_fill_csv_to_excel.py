@@ -111,8 +111,10 @@ class TableRecord:
     skip_detail: bool
     output_no: int | None = None
     output_sheet: str = ""
-    before_extraction_condition: str = ""
-    after_extraction_condition: str = ""
+    before_current_extraction_condition: str = ""
+    before_new_extraction_condition: str = ""
+    after_current_extraction_condition: str = ""
+    after_new_extraction_condition: str = ""
     detail_refs: dict = field(default_factory=dict)
 
 
@@ -237,6 +239,8 @@ def find_after_sql_template_row(tws):
     for r in range(14, max_r + 1):
         text = row_text(tws, r)
         upper = text.upper()
+        if ("取得SQL" in text or "SELECT" in upper) and ("新" not in text):
+            return r
         if "SELECT" in upper and ("WHERE" in upper or "抽出条件" in text or "テーブル" in text):
             return r
     text16 = row_text(tws, 16)
@@ -247,20 +251,37 @@ def find_after_sql_template_row(tws):
 
 def template_layout(tws):
     after_sql = find_after_sql_template_row(tws)
+    def has_new_sql_row(start, end):
+        for r in range(max(1, start), min(tws.max_row, end) + 1):
+            text = row_text(tws, r)
+            if "取得SQL" in text and "新" in text:
+                return True
+        return False
+
+    before_has_new_sql = has_new_sql_row(3, 6)
+    after_has_new_sql = has_new_sql_row(after_sql, after_sql + 3)
+    before_offset = 1 if before_has_new_sql else 0
+    after_offset = 1 if after_has_new_sql else 0
     return {
         "after_sql": after_sql,
-        "after_header": after_sql + 1,
-        "after_data": after_sql + 2,
-        "after_new": after_sql + 5,
-        "after_compare": after_sql + 8,
-        "count_title": after_sql + 11,
-        "before_count": after_sql + 12,
-        "after_count": after_sql + 13,
-        "count_diff": after_sql + 14,
-        "pre_cross_title": after_sql + 15,
-        "cross_title": after_sql + 16,
-        "cross_current": after_sql + 17,
-        "cross_new": after_sql + 20,
+        "before_sql_new": 4 if before_has_new_sql else None,
+        "before_header": 4 + before_offset,
+        "before_data": 5 + before_offset,
+        "before_new": 8 + before_offset,
+        "before_compare": 11 + before_offset,
+        "after_sql_new": after_sql + 1 if after_has_new_sql else None,
+        "after_header": after_sql + 1 + after_offset,
+        "after_data": after_sql + 2 + after_offset,
+        "after_new": after_sql + 5 + after_offset,
+        "after_compare": after_sql + 8 + after_offset,
+        "count_title": after_sql + 11 + after_offset,
+        "before_count": after_sql + 12 + after_offset,
+        "after_count": after_sql + 13 + after_offset,
+        "count_diff": after_sql + 14 + after_offset,
+        "pre_cross_title": after_sql + 15 + after_offset,
+        "cross_title": after_sql + 16 + after_offset,
+        "cross_current": after_sql + 17 + after_offset,
+        "cross_new": after_sql + 20 + after_offset,
     }
 
 
@@ -683,28 +704,30 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
     write_static_from_template(tws, ows, 2, r, block_last_col)
     r += 1
     write_static_from_template(tws, ows, 3, r, block_last_col)
-    before_condition = record.before_extraction_condition or "抽出条件"
-    after_condition = record.after_extraction_condition or "抽出条件"
-    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {before_condition}"
+    before_current_condition = record.before_current_extraction_condition
+    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {before_current_condition}" if before_current_condition else f"SELECT * FROM {record.sql_name}"
     force_font_name(ows.cell(r, 3))
     r += 1
-    write_header_row(tws, ows, 4, r, before_header, col_count, block_last_col, header_rows)
+    if layout.get("before_sql_new"):
+        write_static_from_template(tws, ows, layout["before_sql_new"], r, block_last_col)
+        r += 1
+    write_header_row(tws, ows, layout["before_header"], r, before_header, col_count, block_last_col, header_rows)
     r += 1
 
     before_curr_start = r
-    write_data_rows(tws, ows, 5, before_curr_start, before_rows, before_disp, col_count, block_last_col, gray_if_empty=(before_count == 0))
+    write_data_rows(tws, ows, layout["before_data"], before_curr_start, before_rows, before_disp, col_count, block_last_col, gray_if_empty=(before_count == 0))
     merge_b_label(ows, before_curr_start, before_disp, "現")
     r += before_disp
 
     before_new_start = r
-    write_blank_rows(tws, ows, 8, before_new_start, before_disp, col_count, block_last_col)
+    write_blank_rows(tws, ows, layout["before_new"], before_new_start, before_disp, col_count, block_last_col)
     merge_b_label(ows, before_new_start, before_disp, "新")
     apply_horizontal_border(ows, before_new_start, 2, data_last_col, MEDIUM_SIDE, where="top")
     clear_horizontal_border(ows, before_new_start, data_last_col + 1, block_last_col, where="top")
     r += before_disp
 
     before_cmp_start = r
-    write_vertical_compare_rows(tws, ows, 11, before_cmp_start, before_disp, before_curr_start, before_new_start, col_count, block_last_col, table_aliases, before_header, compare_exclusions)
+    write_vertical_compare_rows(tws, ows, layout["before_compare"], before_cmp_start, before_disp, before_curr_start, before_new_start, col_count, block_last_col, table_aliases, before_header, compare_exclusions)
     cf_targets.append({"kind": "before_compare", "start": before_cmp_start, "end": before_cmp_start + before_disp - 1, "data_last_col": data_last_col})
     compare_b_ranges.append((before_cmp_start, before_cmp_start + before_disp - 1))
     r += before_disp
@@ -716,9 +739,13 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
         r += 1
 
     write_static_from_template(tws, ows, layout["after_sql"], r, block_last_col)
-    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {after_condition}"
+    after_current_condition = record.after_current_extraction_condition
+    ows.cell(r, 3).value = f"SELECT * FROM {record.sql_name} WHERE {after_current_condition}" if after_current_condition else f"SELECT * FROM {record.sql_name}"
     force_font_name(ows.cell(r, 3))
     r += 1
+    if layout.get("after_sql_new"):
+        write_static_from_template(tws, ows, layout["after_sql_new"], r, block_last_col)
+        r += 1
     write_header_row(tws, ows, layout["after_header"], r, after_header, col_count, block_last_col, header_rows)
     r += 1
 
@@ -943,6 +970,15 @@ def _normalize_table_key(value):
     if text.endswith(".csv"):
         text = text[:-4]
     return text
+
+
+def _normalize_mark_text(value):
+    text = "" if value is None else str(value).strip()
+    return "CIRCLE" if text in {"\u25cb", "\u3007"} else text
+
+
+def is_selected_mark(value, expected):
+    return _normalize_mark_text(value) == _normalize_mark_text(expected)
 
 
 def read_compare_exclusions(wb):
@@ -1415,7 +1451,7 @@ def read_selected_table_names_from_workbook(path: Path, sheet_name, mark_col, ta
         for r in range(1, ws.max_row + 1):
             mark = ws.cell(r, mark_col_idx).value
             table_name = ws.cell(r, table_col_idx).value
-            if str(mark).strip() != expected:
+            if not is_selected_mark(mark, expected):
                 continue
             key = _normalize_table_key(table_name)
             if key:
@@ -1428,9 +1464,10 @@ def read_selected_table_names_from_workbook(path: Path, sheet_name, mark_col, ta
             pass
 
 
-def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_col, table_col, before_condition_col, after_condition_col, mark_value="〇"):
-    """出力済みExcelの指定シートから、〇が付いた表名ごとの打鍵前/打鍵後抽出条件を読む。"""
-    if not sheet_name or (not before_condition_col and not after_condition_col) or path is None or not path.exists():
+def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_col, table_col, before_current_col, before_new_col, after_current_col, after_new_col, mark_value="〇"):
+    """出力済みExcelの指定シートから、〇が付いた表名ごとの4種類の抽出条件を読む。"""
+    condition_cols = [before_current_col, before_new_col, after_current_col, after_new_col]
+    if not sheet_name or not any(condition_cols) or path is None or not path.exists():
         return {}
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
@@ -1439,23 +1476,32 @@ def read_selected_table_conditions_from_workbook(path: Path, sheet_name, mark_co
         ws = wb[sheet_name]
         mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
         table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
-        before_condition_col_idx = column_index_from_config(before_condition_col, "対象表選択打鍵前条件列") if before_condition_col else None
-        after_condition_col_idx = column_index_from_config(after_condition_col, "対象表選択打鍵後条件列") if after_condition_col else None
+        before_current_idx = column_index_from_config(before_current_col, "対象表選択打鍵前現条件列") if before_current_col else None
+        before_new_idx = column_index_from_config(before_new_col, "対象表選択打鍵前新条件列") if before_new_col else None
+        after_current_idx = column_index_from_config(after_current_col, "対象表選択打鍵後現条件列") if after_current_col else None
+        after_new_idx = column_index_from_config(after_new_col, "対象表選択打鍵後新条件列") if after_new_col else None
         expected = "" if mark_value is None else str(mark_value).strip()
         conditions = {}
+
+        def read_condition(row, col_idx):
+            if not col_idx:
+                return ""
+            value = ws.cell(row, col_idx).value
+            return "" if value is None else str(value).strip()
+
         for r in range(1, ws.max_row + 1):
             mark = ws.cell(r, mark_col_idx).value
             table_name = ws.cell(r, table_col_idx).value
-            if str(mark).strip() != expected:
+            if not is_selected_mark(mark, expected):
                 continue
             key = _normalize_table_key(table_name)
             if not key:
                 continue
-            before_condition = ws.cell(r, before_condition_col_idx).value if before_condition_col_idx else None
-            after_condition = ws.cell(r, after_condition_col_idx).value if after_condition_col_idx else None
             conditions[key] = {
-                "before": "" if before_condition is None else str(before_condition).strip(),
-                "after": "" if after_condition is None else str(after_condition).strip(),
+                "before_current": read_condition(r, before_current_idx),
+                "before_new": read_condition(r, before_new_idx),
+                "after_current": read_condition(r, after_current_idx),
+                "after_new": read_condition(r, after_new_idx),
             }
         return conditions
     finally:
@@ -1481,11 +1527,15 @@ def apply_selected_table_conditions(records, table_conditions):
             if alias in table_conditions:
                 conditions = table_conditions[alias]
                 if isinstance(conditions, dict):
-                    record.before_extraction_condition = conditions.get("before", "")
-                    record.after_extraction_condition = conditions.get("after", "")
+                    record.before_current_extraction_condition = conditions.get("before_current", "")
+                    record.before_new_extraction_condition = conditions.get("before_new", "")
+                    record.after_current_extraction_condition = conditions.get("after_current", "")
+                    record.after_new_extraction_condition = conditions.get("after_new", "")
                 else:
-                    record.before_extraction_condition = str(conditions or "")
-                    record.after_extraction_condition = str(conditions or "")
+                    record.before_current_extraction_condition = str(conditions or "")
+                    record.before_new_extraction_condition = str(conditions or "")
+                    record.after_current_extraction_condition = str(conditions or "")
+                    record.after_new_extraction_condition = str(conditions or "")
                 break
 
 
@@ -1498,34 +1548,44 @@ def table_aliases_with_csv_data_from_records(records):
     return aliases
 
 
-def find_or_create_selector_result_col(ws, header_name="CSVデータ不一致"):
+def find_or_create_selector_result_col(ws, header_name="CSVデータ不一致", header_row=3):
+    for c in range(1, ws.max_column + 1):
+        if str(ws.cell(header_row, c).value or "").strip() == header_name:
+            return c
     for c in range(1, ws.max_column + 1):
         if str(ws.cell(1, c).value or "").strip() == header_name:
+            ws.cell(1, c).value = None
+            ws.cell(header_row, c).value = header_name
+            ws.cell(header_row, c).font = Font(name=FONT_NAME, bold=True)
+            ws.cell(header_row, c).alignment = Alignment(horizontal="center", vertical="center")
             return c
     col = ws.max_column + 1
-    ws.cell(1, col).value = header_name
-    ws.cell(1, col).font = Font(name=FONT_NAME, bold=True)
-    ws.cell(1, col).alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(header_row, col).value = header_name
+    ws.cell(header_row, col).font = Font(name=FONT_NAME, bold=True)
+    ws.cell(header_row, col).alignment = Alignment(horizontal="center", vertical="center")
     ws.column_dimensions[get_column_letter(col)].width = max(ws.column_dimensions[get_column_letter(col)].width or 0, 28)
     return col
 
 
-def mark_selector_csv_mismatches(wb, sheet_name, mark_col, table_col, mark_value, data_table_aliases):
+def mark_selector_csv_mismatches(wb, sheet_name, mark_col, table_col, mark_value, data_table_aliases, selected_table_names=None):
     if not sheet_name or sheet_name not in wb.sheetnames:
         return 0
     ws = wb[sheet_name]
     mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
     table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
-    result_col_idx = find_or_create_selector_result_col(ws)
+    result_col_idx = find_or_create_selector_result_col(ws, header_row=3)
     expected = "" if mark_value is None else str(mark_value).strip()
     mismatch_count = 0
-    for r in range(2, ws.max_row + 1):
+    for r in range(4, ws.max_row + 1):
         table_name = ws.cell(r, table_col_idx).value
         table_key = _normalize_table_key(table_name)
         if not table_key:
             ws.cell(r, result_col_idx).value = None
             continue
-        selected = str(ws.cell(r, mark_col_idx).value).strip() == expected
+        if selected_table_names is not None:
+            selected = table_key in selected_table_names
+        else:
+            selected = is_selected_mark(ws.cell(r, mark_col_idx).value, expected)
         has_csv_data = table_key in data_table_aliases
         result = ""
         if selected and not has_csv_data:
@@ -1732,6 +1792,10 @@ def main():
     selector_legacy_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択条件列", "選択条件列", "table_selector_condition_column"], default=None)
     selector_before_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵前条件列", "打鍵前条件列", "table_selector_before_condition_column"], default=selector_legacy_condition_col)
     selector_after_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵後条件列", "打鍵後条件列", "table_selector_after_condition_column"], default=selector_legacy_condition_col)
+    selector_before_current_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵前現条件列", "打鍵前現条件列", "table_selector_before_current_condition_column"], default=selector_before_condition_col)
+    selector_before_new_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵前新条件列", "打鍵前新条件列", "table_selector_before_new_condition_column"], default=selector_before_condition_col)
+    selector_after_current_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵後現条件列", "打鍵後現条件列", "table_selector_after_current_condition_column"], default=selector_after_condition_col)
+    selector_after_new_condition_col = cfg_get(old_cfg, common_cfg, keys=["対象表選択打鍵後新条件列", "打鍵後新条件列", "table_selector_after_new_condition_column"], default=selector_after_condition_col)
     selector_mark_value = cfg_get(old_cfg, common_cfg, keys=["対象表選択判定値", "選択判定値", "table_selector_mark_value"], default="〇")
 
     if not template_path.exists():
@@ -1761,12 +1825,30 @@ def main():
             selector_sheet,
             selector_mark_col,
             selector_table_col,
-            selector_before_condition_col,
-            selector_after_condition_col,
+            selector_before_current_condition_col,
+            None,
+            selector_after_current_condition_col,
+            None,
             selector_mark_value,
         )
-        logger.info("対象表選択シート: %s / 判定列: %s / 表名列: %s / 打鍵前条件列: %s / 打鍵後条件列: %s / 判定値: %s", selector_sheet, selector_mark_col, selector_table_col, selector_before_condition_col, selector_after_condition_col, selector_mark_value)
-        logger.info("対象表選択件数: %s / 抽出条件件数: %s", 0 if selected_table_names is None else len(selected_table_names), len(selected_table_conditions))
+        logger.info(
+            "対象表選択シート: %s / 判定列: %s / 表名列: %s / 打鍵前現条件列: %s / 打鍵前新条件列: %s / 打鍵後現条件列: %s / 打鍵後新条件列: %s / 判定値: %s",
+            selector_sheet,
+            selector_mark_col,
+            selector_table_col,
+            selector_before_current_condition_col,
+            selector_before_new_condition_col,
+            selector_after_current_condition_col,
+            selector_after_new_condition_col,
+            selector_mark_value,
+        )
+        non_empty_current_condition_count = sum(
+            1
+            for conditions in selected_table_conditions.values()
+            for key, value in conditions.items()
+            if key in {"before_current", "after_current"} and str(value or "").strip()
+        )
+        logger.info("対象表選択件数: %s / 現抽出条件対象表数: %s / 非空現抽出条件数: %s", 0 if selected_table_names is None else len(selected_table_names), len(selected_table_conditions), non_empty_current_condition_count)
 
     template_wb = load_workbook(template_path)
     compare_exclusions = read_compare_exclusions(template_wb)
@@ -1849,6 +1931,7 @@ def main():
             selector_table_col,
             selector_mark_value,
             data_table_aliases,
+            selected_table_names,
         )
         logger.info("対象表選択CSV不一致件数: %s", mismatch_count)
 
