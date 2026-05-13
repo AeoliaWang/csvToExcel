@@ -732,7 +732,8 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
     compare_b_ranges.append((before_cmp_start, before_cmp_start + before_disp - 1))
     r += before_disp
 
-    for tmpl_row in range(14, layout["after_sql"]):
+    before_compare_template_end = layout["before_compare"] + 2
+    for tmpl_row in range(before_compare_template_end + 1, layout["after_sql"]):
         if is_update_count_template_row(tws, tmpl_row):
             continue
         write_static_from_template(tws, ows, tmpl_row, r, block_last_col)
@@ -870,7 +871,7 @@ def extract_x14_compare_cf_templates(template_path: Path, layout, sheet_name=Non
         if min_row is None:
             continue
         item = {"block": block, "src_min_row": min_row, "src_max_row": max_row}
-        if min_row <= 11 <= max_row:
+        if min_row <= layout["before_compare"] <= max_row:
             result.setdefault("before_compare", item)
         if min_row <= layout["after_compare"] <= max_row:
             result.setdefault("after_compare", item)
