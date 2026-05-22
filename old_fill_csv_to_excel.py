@@ -29,7 +29,9 @@ import json
 import io
 import logging
 import os
+import posixpath
 import re
+import shutil
 import tempfile
 import uuid
 import warnings
@@ -818,6 +820,33 @@ def write_block(tws, ows, start_row, record, layout, header_rows, cf_targets, co
 
 
 # ===== x14 条件付き書式 =====
+def sheet_xml_paths(xlsx_path: Path) -> dict[str, str]:
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        wb_root = ET.fromstring(z.read("xl/workbook.xml"))
+        ns_main = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        ns_rel = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        sheets_el = wb_root.find(f"{ns_main}sheets")
+        sheets = list(sheets_el) if sheets_el is not None else []
+        rels_root = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+        rel_targets = {
+            rel.attrib.get("Id"): rel.attrib.get("Target", "")
+            for rel in rels_root.findall(f"{rel_ns}Relationship")
+        }
+        result = {}
+        for sheet in sheets:
+            name = sheet.attrib.get("name")
+            rid = sheet.attrib.get(f"{ns_rel}id")
+            target = rel_targets.get(rid, "")
+            if not name or not target:
+                continue
+            if target.startswith("/"):
+                result[name] = target.lstrip("/")
+            else:
+                result[name] = posixpath.normpath(str(PurePosixPath("xl") / target))
+        return result
+
+
 def resolve_sheet_xml_path(xlsx_path: Path, sheet_name=None):
     with zipfile.ZipFile(xlsx_path, "r") as z:
         wb_root = ET.fromstring(z.read("xl/workbook.xml"))
@@ -954,6 +983,468 @@ def inject_x14_conditional_formatting_for_sheet(xlsx_path: Path, template_path: 
 def inject_x14_conditional_formatting(xlsx_path: Path, template_path: Path, sheet_targets: dict[str, list[dict]], layout, template_sheet_name=None):
     for sheet_name, targets in sheet_targets.items():
         inject_x14_conditional_formatting_for_sheet(xlsx_path, template_path, sheet_name, targets, layout, template_sheet_name)
+
+
+# ===== drawing / image preservation for untouched sheets =====
+def rels_path_for_part(part_path: str) -> str:
+    part = PurePosixPath(part_path)
+    return str(part.parent / "_rels" / f"{part.name}.rels")
+
+
+def resolve_related_part(source_part: str, target: str) -> str | None:
+    if not target or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target):
+        return None
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(str(PurePosixPath(source_part).parent / target)).lstrip("/")
+
+
+def _read_zip_text(z, name: str) -> str | None:
+    try:
+        return z.read(name).decode("utf-8")
+    except KeyError:
+        return None
+
+
+def _collect_internal_related_parts(z, part_path: str, collected: set[str]):
+    if part_path in collected or part_path not in z.namelist():
+        return
+    collected.add(part_path)
+    rels_path = rels_path_for_part(part_path)
+    if rels_path not in z.namelist():
+        return
+    collected.add(rels_path)
+    try:
+        rels_root = ET.fromstring(z.read(rels_path))
+    except Exception:
+        return
+    rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    for rel in rels_root.findall(f"{rel_ns}Relationship"):
+        if rel.attrib.get("TargetMode") == "External":
+            continue
+        target_part = resolve_related_part(part_path, rel.attrib.get("Target", ""))
+        if target_part:
+            _collect_internal_related_parts(z, target_part, collected)
+
+
+def _merge_content_types(src_xml: bytes, dst_xml: bytes) -> bytes:
+    ns = "{http://schemas.openxmlformats.org/package/2006/content-types}"
+    try:
+        src_root = ET.fromstring(src_xml)
+        dst_root = ET.fromstring(dst_xml)
+    except Exception:
+        return dst_xml
+
+    existing_defaults = {el.attrib.get("Extension") for el in dst_root.findall(f"{ns}Default")}
+    existing_overrides = {el.attrib.get("PartName") for el in dst_root.findall(f"{ns}Override")}
+    for el in src_root.findall(f"{ns}Default"):
+        if el.attrib.get("Extension") not in existing_defaults:
+            dst_root.append(copy(el))
+            existing_defaults.add(el.attrib.get("Extension"))
+    for el in src_root.findall(f"{ns}Override"):
+        if el.attrib.get("PartName") not in existing_overrides:
+            dst_root.append(copy(el))
+            existing_overrides.add(el.attrib.get("PartName"))
+    ET.register_namespace("", "http://schemas.openxmlformats.org/package/2006/content-types")
+    return ET.tostring(dst_root, encoding="utf-8", xml_declaration=True)
+
+
+def _merge_workbook_rels_shared_strings(src_xml: bytes, dst_xml: bytes) -> bytes:
+    rel_ns_uri = "http://schemas.openxmlformats.org/package/2006/relationships"
+    rel_ns = f"{{{rel_ns_uri}}}"
+    try:
+        src_root = ET.fromstring(src_xml)
+        dst_root = ET.fromstring(dst_xml)
+    except Exception:
+        return dst_xml
+
+    shared_type_suffix = "/sharedStrings"
+    src_shared = [
+        rel for rel in src_root.findall(f"{rel_ns}Relationship")
+        if str(rel.attrib.get("Type", "")).endswith(shared_type_suffix)
+    ]
+    if not src_shared:
+        return dst_xml
+
+    dst_shared = [
+        rel for rel in dst_root.findall(f"{rel_ns}Relationship")
+        if str(rel.attrib.get("Type", "")).endswith(shared_type_suffix)
+    ]
+    if dst_shared:
+        return dst_xml
+
+    used_ids = {rel.attrib.get("Id") for rel in dst_root.findall(f"{rel_ns}Relationship")}
+    next_id = 1
+    for src_rel in src_shared:
+        attrs = dict(src_rel.attrib)
+        rel_id = attrs.get("Id") or "rId1"
+        if rel_id in used_ids:
+            while f"rId{next_id}" in used_ids:
+                next_id += 1
+            rel_id = f"rId{next_id}"
+        attrs["Id"] = rel_id
+        dst_root.append(ET.Element(f"{rel_ns}Relationship", attrs))
+        used_ids.add(rel_id)
+
+    ET.register_namespace("", rel_ns_uri)
+    return ET.tostring(dst_root, encoding="utf-8", xml_declaration=True)
+
+
+def _sheet_xml_uses_shared_strings(xml: str) -> bool:
+    return bool(re.search(r'\bt=["\']s["\']', xml or ""))
+
+
+def collect_sheet_drawings_to_preserve(xlsx_path: Path, preserve_sheet_names: set[str]) -> dict[str, dict]:
+    if not preserve_sheet_names or not xlsx_path.exists():
+        return {}
+
+    result = {}
+    try:
+        sheet_paths = sheet_xml_paths(xlsx_path)
+    except Exception:
+        return result
+
+    drawing_tag_re = re.compile(
+        r"<(?:\w+:)?(?:drawing|legacyDrawing|legacyDrawingHF|picture)\b[^>]*/>",
+        re.IGNORECASE,
+    )
+    rid_re = re.compile(r'\br:id="([^"]+)"')
+    rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        zip_names = set(z.namelist())
+        for sheet_name in preserve_sheet_names:
+            xml_path = sheet_paths.get(sheet_name)
+            if not xml_path:
+                continue
+            xml = _read_zip_text(z, xml_path)
+            if not xml:
+                continue
+            drawing_tags = drawing_tag_re.findall(xml)
+            if not drawing_tags:
+                continue
+            drawing_rids = set()
+            for tag in drawing_tags:
+                drawing_rids.update(rid_re.findall(tag))
+            if not drawing_rids:
+                continue
+
+            rels_path = rels_path_for_part(xml_path)
+            if rels_path not in zip_names:
+                continue
+            try:
+                rels_root = ET.fromstring(z.read(rels_path))
+            except Exception:
+                continue
+            rels = []
+            copied_parts = set()
+            for rel in rels_root.findall(f"{rel_ns}Relationship"):
+                if rel.attrib.get("Id") not in drawing_rids:
+                    continue
+                rels.append(dict(rel.attrib))
+                if rel.attrib.get("TargetMode") != "External":
+                    target_part = resolve_related_part(xml_path, rel.attrib.get("Target", ""))
+                    if target_part:
+                        _collect_internal_related_parts(z, target_part, copied_parts)
+            if rels:
+                result[sheet_name] = {
+                    "drawing_tags": drawing_tags,
+                    "rels": rels,
+                    "parts": copied_parts,
+                }
+    return result
+
+
+def collect_sheet_parts_to_preserve(xlsx_path: Path, preserve_sheet_names: set[str]) -> dict[str, dict]:
+    if not preserve_sheet_names or not xlsx_path.exists():
+        return {}
+
+    result = {}
+    try:
+        sheet_paths = sheet_xml_paths(xlsx_path)
+    except Exception:
+        return result
+
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        zip_names = set(z.namelist())
+        for sheet_name in preserve_sheet_names:
+            xml_path = sheet_paths.get(sheet_name)
+            if not xml_path or xml_path not in zip_names:
+                continue
+            parts = set()
+            _collect_internal_related_parts(z, xml_path, parts)
+            parts.add(xml_path)
+            xml = _read_zip_text(z, xml_path)
+            if _sheet_xml_uses_shared_strings(xml or "") and "xl/sharedStrings.xml" in zip_names:
+                parts.add("xl/sharedStrings.xml")
+            result[sheet_name] = {"xml_path": xml_path, "parts": parts}
+    return result
+
+
+def sheet_names_with_image_parts(xlsx_path: Path) -> set[str]:
+    if not xlsx_path.exists():
+        return set()
+    try:
+        sheet_paths = sheet_xml_paths(xlsx_path)
+    except Exception:
+        return set()
+
+    image_sheet_names = set()
+    drawing_tag_re = re.compile(
+        r"<(?:\w+:)?(?:drawing|legacyDrawing|legacyDrawingHF|picture|oleObjects?)\b",
+        re.IGNORECASE,
+    )
+    rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    related_markers = (
+        "/drawing",
+        "/vmlDrawing",
+        "/image",
+        "/oleObject",
+        "/control",
+    )
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        zip_names = set(z.namelist())
+        for sheet_name, xml_path in sheet_paths.items():
+            xml = _read_zip_text(z, xml_path)
+            if xml and drawing_tag_re.search(xml):
+                image_sheet_names.add(sheet_name)
+                continue
+            rels_path = rels_path_for_part(xml_path)
+            if rels_path not in zip_names:
+                continue
+            try:
+                rels_root = ET.fromstring(z.read(rels_path))
+            except Exception:
+                continue
+            for rel in rels_root.findall(f"{rel_ns}Relationship"):
+                rel_type = rel.attrib.get("Type", "")
+                target = rel.attrib.get("Target", "")
+                if any(marker in rel_type or marker in target for marker in related_markers):
+                    image_sheet_names.add(sheet_name)
+                    break
+    return image_sheet_names
+
+
+def sheet_index_map(xlsx_path: Path) -> dict[str, int]:
+    if not xlsx_path.exists():
+        return {}
+    try:
+        with zipfile.ZipFile(xlsx_path, "r") as z:
+            wb_root = ET.fromstring(z.read("xl/workbook.xml"))
+    except Exception:
+        return {}
+    sheets = [el for el in wb_root.iter() if el.tag.endswith("sheet")]
+    return {sheet.attrib.get("name"): idx for idx, sheet in enumerate(sheets) if sheet.attrib.get("name")}
+
+
+def restore_sheet_order_positions(xlsx_path: Path, desired_indexes: dict[str, int]):
+    if not desired_indexes:
+        return False
+
+    tmp_dir = xlsx_path.parent if xlsx_path.parent.exists() else Path(".")
+    tmp = tempfile.NamedTemporaryFile(prefix=f".{xlsx_path.stem}_", suffix=".tmp.xlsx", dir=tmp_dir, delete=False)
+    tmp_name = Path(tmp.name)
+    tmp.close()
+    changed = False
+    ns_uri = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ET.register_namespace("", ns_uri)
+    ET.register_namespace("r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships")
+
+    try:
+        with zipfile.ZipFile(xlsx_path, "r") as zin, zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "xl/workbook.xml":
+                    try:
+                        wb_root = ET.fromstring(data)
+                        sheets_el = next((el for el in wb_root.iter() if el.tag.endswith("sheets")), None)
+                    except Exception:
+                        sheets_el = None
+                    if sheets_el is not None:
+                        sheet_elements = list(sheets_el)
+                        preserved = [
+                            sheet for sheet in sheet_elements
+                            if sheet.attrib.get("name") in desired_indexes
+                        ]
+                        if preserved:
+                            for sheet in preserved:
+                                sheets_el.remove(sheet)
+                            for sheet in sorted(preserved, key=lambda el: desired_indexes.get(el.attrib.get("name"), 10**9)):
+                                insert_at = min(max(desired_indexes.get(sheet.attrib.get("name"), len(sheets_el)), 0), len(sheets_el))
+                                sheets_el.insert(insert_at, sheet)
+                            data = ET.tostring(wb_root, encoding="utf-8", xml_declaration=True)
+                            changed = True
+                zout.writestr(info, data)
+        if changed:
+            os.replace(tmp_name, xlsx_path)
+        return changed
+    finally:
+        try:
+            tmp_name.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def reinject_preserved_sheet_parts(xlsx_path: Path, source_path: Path, preserved: dict[str, dict]):
+    if not preserved:
+        return False
+    try:
+        output_sheet_paths = sheet_xml_paths(xlsx_path)
+        source_sheet_paths = sheet_xml_paths(source_path)
+    except Exception:
+        return False
+
+    source_to_output = {}
+    parts_to_copy = set()
+    for sheet_name, item in preserved.items():
+        src_xml_path = source_sheet_paths.get(sheet_name, item.get("xml_path"))
+        dst_xml_path = output_sheet_paths.get(sheet_name)
+        if not src_xml_path or not dst_xml_path:
+            continue
+        source_to_output[src_xml_path] = dst_xml_path
+        for part in item.get("parts", set()):
+            if part == src_xml_path:
+                parts_to_copy.add((src_xml_path, dst_xml_path))
+            else:
+                parts_to_copy.add((part, part))
+        src_rels = rels_path_for_part(src_xml_path)
+        dst_rels = rels_path_for_part(dst_xml_path)
+        parts_to_copy.add((src_rels, dst_rels))
+
+    if not parts_to_copy:
+        return False
+
+    tmp_dir = xlsx_path.parent if xlsx_path.parent.exists() else Path(".")
+    tmp = tempfile.NamedTemporaryFile(prefix=f".{xlsx_path.stem}_", suffix=".tmp.xlsx", dir=tmp_dir, delete=False)
+    tmp_name = Path(tmp.name)
+    tmp.close()
+
+    try:
+        with zipfile.ZipFile(source_path, "r") as zsrc, zipfile.ZipFile(xlsx_path, "r") as zin, zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+            source_names = set(zsrc.namelist())
+            replacement_by_dest = {dst: src for src, dst in parts_to_copy if src in source_names}
+            shared_strings_needed = "xl/sharedStrings.xml" in replacement_by_dest
+            copied_dest = set()
+            for info in zin.infolist():
+                if info.filename == "[Content_Types].xml":
+                    data = _merge_content_types(zsrc.read(info.filename), zin.read(info.filename))
+                elif info.filename == "xl/_rels/workbook.xml.rels" and shared_strings_needed and info.filename in source_names:
+                    data = _merge_workbook_rels_shared_strings(zsrc.read(info.filename), zin.read(info.filename))
+                elif info.filename in replacement_by_dest:
+                    data = zsrc.read(replacement_by_dest[info.filename])
+                    copied_dest.add(info.filename)
+                else:
+                    data = zin.read(info.filename)
+                zout.writestr(info, data)
+
+            for dest, src in replacement_by_dest.items():
+                if dest in copied_dest:
+                    continue
+                zout.writestr(dest, zsrc.read(src))
+                copied_dest.add(dest)
+
+        os.replace(tmp_name, xlsx_path)
+        return True
+    finally:
+        try:
+            tmp_name.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def reinject_preserved_sheet_drawings(xlsx_path: Path, source_path: Path, preserved: dict[str, dict]):
+    if not preserved:
+        return False
+    try:
+        sheet_paths = sheet_xml_paths(xlsx_path)
+    except Exception:
+        return False
+
+    tmp_dir = xlsx_path.parent if xlsx_path.parent.exists() else Path(".")
+    tmp = tempfile.NamedTemporaryFile(prefix=f".{xlsx_path.stem}_", suffix=".tmp.xlsx", dir=tmp_dir, delete=False)
+    tmp_name = Path(tmp.name)
+    tmp.close()
+    rel_ns_uri = "http://schemas.openxmlformats.org/package/2006/relationships"
+    rel_ns = f"{{{rel_ns_uri}}}"
+    ET.register_namespace("", rel_ns_uri)
+    changed = False
+    copied_parts = set()
+
+    try:
+        with zipfile.ZipFile(source_path, "r") as zsrc, zipfile.ZipFile(xlsx_path, "r") as zin, zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+            source_names = set(zsrc.namelist())
+            target_names = set(zin.namelist())
+            xml_replacements = {}
+            rel_replacements = {}
+
+            for sheet_name, item in preserved.items():
+                xml_path = sheet_paths.get(sheet_name)
+                if not xml_path or xml_path not in target_names:
+                    continue
+                xml = zin.read(xml_path).decode("utf-8")
+                xml = re.sub(r"<(?:\w+:)?(?:drawing|legacyDrawing|legacyDrawingHF|picture)\b[^>]*/>", "", xml)
+
+                rels_path = rels_path_for_part(xml_path)
+                if rels_path in target_names:
+                    rels_root = ET.fromstring(zin.read(rels_path))
+                else:
+                    rels_root = ET.Element(f"{rel_ns}Relationships")
+
+                used_ids = {rel.attrib.get("Id") for rel in rels_root.findall(f"{rel_ns}Relationship")}
+                next_id = 1
+                tag_xml = "\n".join(item["drawing_tags"])
+                for rel_attrs in item["rels"]:
+                    old_id = rel_attrs.get("Id")
+                    new_id = old_id
+                    if new_id in used_ids:
+                        while f"rId{next_id}" in used_ids:
+                            next_id += 1
+                        new_id = f"rId{next_id}"
+                    attrs = dict(rel_attrs)
+                    attrs["Id"] = new_id
+                    ET.SubElement(rels_root, f"{rel_ns}Relationship", attrs)
+                    used_ids.add(new_id)
+                    if old_id and old_id != new_id:
+                        tag_xml = tag_xml.replace(f'r:id="{old_id}"', f'r:id="{new_id}"')
+
+                insert_at = xml.find("<extLst")
+                if insert_at < 0:
+                    insert_at = xml.rfind("</worksheet>")
+                if insert_at >= 0:
+                    xml = xml[:insert_at] + tag_xml + xml[insert_at:]
+                    xml_replacements[xml_path] = xml.encode("utf-8")
+                    rel_replacements[rels_path] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
+                    copied_parts.update(item["parts"])
+                    changed = True
+
+            for info in zin.infolist():
+                if info.filename == "[Content_Types].xml" and copied_parts:
+                    data = _merge_content_types(zsrc.read(info.filename), zin.read(info.filename))
+                elif info.filename in xml_replacements:
+                    data = xml_replacements[info.filename]
+                elif info.filename in rel_replacements:
+                    data = rel_replacements[info.filename]
+                else:
+                    data = zin.read(info.filename)
+                zout.writestr(info, data)
+
+            existing_after_base = target_names | set(xml_replacements) | set(rel_replacements)
+            for part in sorted(copied_parts):
+                if part in existing_after_base or part not in source_names:
+                    continue
+                zout.writestr(part, zsrc.read(part))
+                existing_after_base.add(part)
+            for rels_path, data in rel_replacements.items():
+                if rels_path not in target_names:
+                    zout.writestr(rels_path, data)
+
+        if changed:
+            os.replace(tmp_name, xlsx_path)
+        return changed
+    finally:
+        try:
+            tmp_name.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ===== summary =====
@@ -1873,7 +2364,32 @@ def main():
     output_records = assign_output_positions(records, sheet_name_arg, tables_per_sheet)
 
     replace_sheets_mode = output_path.exists() and existing_action == ACTION_REPLACE_SHEETS
+    preserved_image_sheet_parts = {}
+    preserved_image_sheet_source = None
+    preserved_image_sheet_indexes = {}
     if replace_sheets_mode:
+        try:
+            existing_sheet_names = set(sheet_xml_paths(output_path).keys())
+        except Exception:
+            existing_sheet_names = set()
+        existing_sheet_indexes = sheet_index_map(output_path)
+        image_sheet_names = sheet_names_with_image_parts(output_path)
+        preserved_image_sheet_names = {
+            name for name in existing_sheet_names
+            if not is_table_output_sheet(name, sheet_name_arg) and name not in {SUMMARY_SHEET_NAME, "summary"}
+            and name in image_sheet_names
+        }
+        preserved_image_sheet_indexes = {
+            name: existing_sheet_indexes[name]
+            for name in preserved_image_sheet_names
+            if name in existing_sheet_indexes
+        }
+        preserved_image_sheet_parts = collect_sheet_parts_to_preserve(output_path, preserved_image_sheet_names)
+        if preserved_image_sheet_parts:
+            tmp_preserve = tempfile.NamedTemporaryFile(prefix=f".{output_path.stem}_image_sheets_", suffix=".xlsx", dir=output_path.parent, delete=False)
+            preserved_image_sheet_source = Path(tmp_preserve.name)
+            tmp_preserve.close()
+            shutil.copy2(output_path, preserved_image_sheet_source)
         wb = load_workbook(output_path)
         table_insert_index, summary_insert_index = remove_existing_output_sheets(wb, sheet_name_arg)
         # テーブル検証シートがテーブルシートより前に戻される場合、
@@ -1952,6 +2468,16 @@ def main():
 
     save_workbook_atomic(wb, output_path)
     inject_x14_conditional_formatting(output_path, template_path, table_sheet_targets, layout, tws.title)
+    try:
+        if preserved_image_sheet_source and preserved_image_sheet_parts:
+            reinject_preserved_sheet_parts(output_path, preserved_image_sheet_source, preserved_image_sheet_parts)
+            restore_sheet_order_positions(output_path, preserved_image_sheet_indexes)
+    finally:
+        if preserved_image_sheet_source:
+            try:
+                preserved_image_sheet_source.unlink(missing_ok=True)
+            except Exception:
+                pass
     print_and_log(f"出力しました: {output_path} / summary={SUMMARY_SHEET_NAME} / mode={existing_action}", logger)
     print_and_log(f"ログファイル: {log_path}", logger)
     if selected_table_names is not None:
