@@ -78,6 +78,7 @@ NO_SIDE = Side(style=None)
 SUMMARY_SHEET_NAME = "テーブル検証"
 COMPARE_EXCLUDE_SHEET_NAME = "現新比較対象外"
 TRIANGLE_MARK = "△"
+CURRENT_NO_UPDATE_NOTE = "現テストで打鍵前後更新なし"
 
 warnings.filterwarnings(
     "ignore",
@@ -92,6 +93,7 @@ class CsvInfo:
     rows: list[list[str]] = field(default_factory=list)
     exists: bool = False
     invalid: bool = False
+    repair_notes: list[str] = field(default_factory=list)
 
     @property
     def count(self) -> int:
@@ -111,6 +113,7 @@ class TableRecord:
     count_diff: int
     notes: list[str]
     skip_detail: bool
+    current_no_update: bool = False
     output_no: int | None = None
     output_sheet: str = ""
     before_current_extraction_condition: str = ""
@@ -123,6 +126,38 @@ class TableRecord:
 # ===== CSV =====
 def _normalize_csv_rows(rows):
     return [["" if v is None else str(v) for v in row] for row in rows]
+
+
+def _is_blank_csv_value(value):
+    return str(value or "").strip(" ") == ""
+
+
+def _is_blank_csv_row(row):
+    return all(_is_blank_csv_value(value) for value in row)
+
+
+def _repair_broken_csv_data_rows(rows, col_count):
+    fixed_rows = []
+    blank_row_count = 0
+    merged_row_count = 0
+    for row in rows:
+        row = list(row)
+        if _is_blank_csv_row(row):
+            blank_row_count += 1
+            continue
+        padded = row + [""] * max(0, col_count - len(row))
+        nonblank_indexes = [idx for idx, value in enumerate(padded) if not _is_blank_csv_value(value)]
+        if len(nonblank_indexes) == 1 and fixed_rows and col_count > 5:
+            idx = nonblank_indexes[0]
+            if len(fixed_rows[-1]) <= idx:
+                fixed_rows[-1].extend([""] * (idx + 1 - len(fixed_rows[-1])))
+            previous = fixed_rows[-1][idx]
+            current = padded[idx]
+            fixed_rows[-1][idx] = f"{previous}\n{current}" if previous else current
+            merged_row_count += 1
+            continue
+        fixed_rows.append(padded[:col_count] if col_count > 0 else row)
+    return fixed_rows, blank_row_count, merged_row_count
 
 
 def _infer_delimiter(text):
@@ -174,10 +209,28 @@ def read_csv_info(path: Path | None) -> CsvInfo:
         return CsvInfo(path=None, exists=False)
     text, _enc = _decode_csv_text(path)
     rows = _normalize_csv_rows(_read_csv_from_text(text))
-    header = rows[0] if rows else []
+    first_nonblank_idx = next((idx for idx, row in enumerate(rows) if not _is_blank_csv_row(row)), None)
+    blank_before_header_count = len(rows) if first_nonblank_idx is None else sum(1 for row in rows[:first_nonblank_idx] if _is_blank_csv_row(row))
+    if first_nonblank_idx is None:
+        rows = []
+        header = []
+        data_source_rows = []
+    else:
+        header = rows[first_nonblank_idx]
+        data_source_rows = rows[first_nonblank_idx + 1:]
     invalid = INVALID_MARKER in text
-    data = [] if invalid else rows[1:]
-    return CsvInfo(path=path, header=header, rows=data, exists=True, invalid=invalid)
+    data_col_count = max(len(header), *(len(r) for r in data_source_rows), 0)
+    repair_notes = []
+    if invalid:
+        data = []
+    else:
+        data, blank_data_row_count, merged_row_count = _repair_broken_csv_data_rows(data_source_rows, data_col_count)
+        blank_row_count = blank_before_header_count + blank_data_row_count
+        if blank_row_count:
+            repair_notes.append(f"空白行を{blank_row_count}行無視")
+        if merged_row_count:
+            repair_notes.append(f"改行により分割された行を{merged_row_count}行結合")
+    return CsvInfo(path=path, header=header, rows=data, exists=True, invalid=invalid, repair_notes=repair_notes)
 
 
 def is_effective_csv_info(info: CsvInfo) -> bool:
@@ -644,6 +697,8 @@ def build_table_records(before_map, after_map, sql_name_mode):
             notes.append("打鍵前CSVがヘッダーのみ。0件扱い")
         if after.exists and not after.invalid and after.count == 0:
             notes.append("打鍵後CSVがヘッダーのみ。0件扱い")
+        notes.extend(f"打鍵前CSVデータ補正: {note}" for note in before.repair_notes)
+        notes.extend(f"打鍵後CSVデータ補正: {note}" for note in after.repair_notes)
 
         before_header = before.header[:]
         after_header = after.header[:]
@@ -660,8 +715,18 @@ def build_table_records(before_map, after_map, sql_name_mode):
         header = before_header if before_header else after_header
         header = list(header[:max_cols]) + [""] * max(0, max_cols - len(header))
 
+        current_no_update = (
+            before.exists
+            and after.exists
+            and not before.invalid
+            and not after.invalid
+            and before.rows == after.rows
+        )
+
         diff = after.count - before.count
-        if after.count > before.count:
+        if current_no_update:
+            crud = ""
+        elif after.count > before.count:
             crud = "C"
         elif after.count < before.count:
             crud = "D"
@@ -669,12 +734,14 @@ def build_table_records(before_map, after_map, sql_name_mode):
             crud = "U"
         else:
             crud = ""
-
-        skip_detail = before.count == 0 and after.count == 0
+        skip_detail = (before.count == 0 and after.count == 0) or current_no_update
+        if current_no_update:
+            notes.append(CURRENT_NO_UPDATE_NOTE)
         if skip_detail:
-            notes.append("打鍵前後とも0件のため明細出力なし")
+            if before.count == 0 and after.count == 0:
+                notes.append("打鍵前後とも0件のため明細出力なし")
 
-        records.append(TableRecord(key, display_name, sql_name, before, after, header, max_cols, crud, diff, notes, skip_detail))
+        records.append(TableRecord(key, display_name, sql_name, before, after, header, max_cols, crud, diff, notes, skip_detail, current_no_update))
     return records
 
 
@@ -1581,14 +1648,18 @@ def write_summary_sheet(wb, records, sheet_index=0):
             diff_ranges = [xl_abs_range(sheet_name, s, 2, e, 2) for s, e in refs.get("compare_b_ranges", []) if s and e and e >= s]
             diff_check_formula = build_countif_diff_formula(diff_ranges)
         else:
-            gen_before_formula = "=0"
-            gen_after_formula = "=0"
-            new_before_formula = "=0"
-            new_after_formula = "=0"
+            gen_before_formula = rec.before.count
+            gen_after_formula = rec.after.count
+            if rec.current_no_update:
+                new_before_formula = rec.before.count
+                new_after_formula = rec.after.count
+            else:
+                new_before_formula = 0
+                new_after_formula = 0
             diff_check_formula = '="OK"'
 
         values = [
-            f'=IF(F{r_idx}>E{r_idx},"C",IF(F{r_idx}<E{r_idx},"D",IF(AND(F{r_idx}=E{r_idx},E{r_idx}<>0),"U","")))',
+            "" if rec.current_no_update else f'=IF(F{r_idx}>E{r_idx},"C",IF(F{r_idx}<E{r_idx},"D",IF(AND(F{r_idx}=E{r_idx},E{r_idx}<>0),"U","")))',
             rec.output_no if rec.output_no is not None else "",
             rec.output_sheet,
             rec.display_name,
@@ -2059,20 +2130,62 @@ def find_or_create_selector_result_col(ws, header_name="CSVデータ不一致", 
     return col
 
 
-def mark_selector_csv_mismatches(wb, sheet_name, mark_col, table_col, mark_value, data_table_aliases, selected_table_names=None):
+def find_or_create_selector_note_col(ws, result_col_idx, header_name="備考", header_row=3):
+    target_col = result_col_idx + 1
+    if str(ws.cell(header_row, target_col).value or "").strip() == header_name:
+        return target_col
+    if not str(ws.cell(header_row, target_col).value or "").strip():
+        note_col_idx = target_col
+    else:
+        ws.insert_cols(target_col)
+        note_col_idx = target_col
+    ws.cell(header_row, note_col_idx).value = header_name
+    ws.cell(header_row, note_col_idx).font = Font(name=FONT_NAME, bold=True)
+    ws.cell(header_row, note_col_idx).alignment = Alignment(horizontal="center", vertical="center")
+    ws.column_dimensions[get_column_letter(note_col_idx)].width = max(ws.column_dimensions[get_column_letter(note_col_idx)].width or 0, 36)
+    return note_col_idx
+
+
+def table_aliases_with_current_no_update(records):
+    aliases = set()
+    for record in records:
+        if record.current_no_update:
+            aliases.update(make_table_aliases(record.display_name, record.sql_name, record.key))
+    return aliases
+
+
+def selector_notes_by_table_alias(records):
+    notes_by_alias = {}
+    for record in records:
+        selector_notes = []
+        if record.current_no_update:
+            selector_notes.append(CURRENT_NO_UPDATE_NOTE)
+        selector_notes.extend(f"打鍵前CSVデータ補正: {note}" for note in record.before.repair_notes)
+        selector_notes.extend(f"打鍵後CSVデータ補正: {note}" for note in record.after.repair_notes)
+        if not selector_notes:
+            continue
+        for alias in make_table_aliases(record.display_name, record.sql_name, record.key):
+            notes_by_alias[alias] = " / ".join(dict.fromkeys(selector_notes))
+    return notes_by_alias
+
+
+def mark_selector_csv_mismatches(wb, sheet_name, mark_col, table_col, mark_value, data_table_aliases, selected_table_names=None, selector_note_by_alias=None):
     if not sheet_name or sheet_name not in wb.sheetnames:
         return 0
     ws = wb[sheet_name]
     mark_col_idx = column_index_from_config(mark_col, "対象表選択判定列")
     table_col_idx = column_index_from_config(table_col, "対象表選択表名列")
     result_col_idx = find_or_create_selector_result_col(ws, header_row=3)
+    note_col_idx = find_or_create_selector_note_col(ws, result_col_idx, header_row=3)
     expected = "" if mark_value is None else str(mark_value).strip()
+    selector_note_by_alias = selector_note_by_alias or {}
     mismatch_count = 0
     for r in range(4, ws.max_row + 1):
         table_name = ws.cell(r, table_col_idx).value
         table_key = _normalize_table_key(table_name)
         if not table_key:
             ws.cell(r, result_col_idx).value = None
+            ws.cell(r, note_col_idx).value = None
             continue
         if selected_table_names is not None:
             selected = table_key in selected_table_names
@@ -2086,6 +2199,9 @@ def mark_selector_csv_mismatches(wb, sheet_name, mark_col, table_col, mark_value
             result = "CSVデータあり/選択なし"
         ws.cell(r, result_col_idx).value = result
         force_font_name(ws.cell(r, result_col_idx))
+        note = selector_note_by_alias.get(table_key, "")
+        ws.cell(r, note_col_idx).value = note
+        force_font_name(ws.cell(r, note_col_idx))
         if result:
             mismatch_count += 1
     return mismatch_count
@@ -2353,6 +2469,7 @@ def main():
 
     records = build_table_records(csv_files(before_dir), csv_files(after_dir), sql_name_mode)
     data_table_aliases = table_aliases_with_csv_data_from_records(records)
+    selector_note_by_alias = selector_notes_by_table_alias(records)
     logger.info("CSV突合テーブル数: %s", len(records))
     logger.info("CSVデータありテーブル数(alias含む): %s", len(data_table_aliases))
     if selected_table_names is not None:
@@ -2449,6 +2566,7 @@ def main():
             selector_mark_value,
             data_table_aliases,
             selected_table_names,
+            selector_note_by_alias,
         )
         logger.info("対象表選択CSV不一致件数: %s", mismatch_count)
 
