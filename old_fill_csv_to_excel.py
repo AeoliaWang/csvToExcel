@@ -1094,7 +1094,7 @@ def _collect_internal_related_parts(z, part_path: str, collected: set[str]):
             _collect_internal_related_parts(z, target_part, collected)
 
 
-def _merge_content_types(src_xml: bytes, dst_xml: bytes) -> bytes:
+def _merge_content_types(src_xml: bytes, dst_xml: bytes, available_parts: set[str]) -> bytes:
     ns = "{http://schemas.openxmlformats.org/package/2006/content-types}"
     try:
         src_root = ET.fromstring(src_xml)
@@ -1109,7 +1109,8 @@ def _merge_content_types(src_xml: bytes, dst_xml: bytes) -> bytes:
             dst_root.append(copy(el))
             existing_defaults.add(el.attrib.get("Extension"))
     for el in src_root.findall(f"{ns}Override"):
-        if el.attrib.get("PartName") not in existing_overrides:
+        if (el.attrib.get("PartName", "").lstrip("/") in available_parts
+                and el.attrib.get("PartName") not in existing_overrides):
             dst_root.append(copy(el))
             existing_overrides.add(el.attrib.get("PartName"))
     ET.register_namespace("", "http://schemas.openxmlformats.org/package/2006/content-types")
@@ -1393,7 +1394,10 @@ def reinject_preserved_sheet_parts(xlsx_path: Path, source_path: Path, preserved
             copied_dest = set()
             for info in zin.infolist():
                 if info.filename == "[Content_Types].xml":
-                    data = _merge_content_types(zsrc.read(info.filename), zin.read(info.filename))
+                    data = _merge_content_types(
+                        zsrc.read(info.filename), zin.read(info.filename),
+                        set(zin.namelist()) | set(replacement_by_dest),
+                    )
                 elif info.filename == "xl/_rels/workbook.xml.rels" and shared_strings_needed and info.filename in source_names:
                     data = _merge_workbook_rels_shared_strings(zsrc.read(info.filename), zin.read(info.filename))
                 elif info.filename in replacement_by_dest:
@@ -1485,7 +1489,10 @@ def reinject_preserved_sheet_drawings(xlsx_path: Path, source_path: Path, preser
 
             for info in zin.infolist():
                 if info.filename == "[Content_Types].xml" and copied_parts:
-                    data = _merge_content_types(zsrc.read(info.filename), zin.read(info.filename))
+                    data = _merge_content_types(
+                        zsrc.read(info.filename), zin.read(info.filename),
+                        target_names | (copied_parts & source_names),
+                    )
                 elif info.filename in xml_replacements:
                     data = xml_replacements[info.filename]
                 elif info.filename in rel_replacements:
@@ -1626,7 +1633,7 @@ def write_summary_sheet(wb, records, sheet_index=0):
         "CRUD", "出力番号", "出力Sheet", "テーブル名",
         "現_打鍵前件数", "現_打鍵後件数", "現_打鍵前後件数差異",
         "新_打鍵前件数", "新_打鍵後件数", "新_打鍵前後件数差異",
-        "現_打鍵前CSV出处", "現_打鍵後CSV出处",
+        "現_打鍵前CSVパス", "現_打鍵後CSVパス",
         "現新件数チェック", "差分チェック", "備考",
     ]
     ws.append(headers)

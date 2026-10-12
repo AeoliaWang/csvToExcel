@@ -138,7 +138,7 @@ class FillResult:
 # ------------------------- CSV 読み込み -------------------------
 
 def _normalize_csv_rows(rows):
-    return [["" if v is None else str(v) for v in row] for row in rows]
+    return [["" if v is None else str(v).strip() for v in row] for row in rows]
 
 
 def _infer_delimiter(text: str) -> str:
@@ -798,9 +798,18 @@ def normalize_rows_and_fonts(ws, max_col: int):
                 force_font_name(cell)
 
 
+def trim_text_cells(ws, max_col: int):
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, max_col + 1):
+            cell = ws.cell(r, c)
+            value = cell.value
+            if isinstance(value, str) and not value.startswith("="):
+                cell.value = value.strip()
+
+
 # ------------------------- テーブル検証 -------------------------
 
-def collect_existing_summary_notes(wb) -> dict[str, str]:
+def collect_existing_summary_info(wb) -> dict[str, dict[str, str]]:
     ws = None
     if SUMMARY_SHEET_NAME in wb.sheetnames:
         ws = wb[SUMMARY_SHEET_NAME]
@@ -812,6 +821,8 @@ def collect_existing_summary_notes(wb) -> dict[str, str]:
     headers = {str(ws.cell(1, c).value).strip(): c for c in range(1, ws.max_column + 1) if ws.cell(1, c).value is not None}
     table_col = headers.get("テーブル名")
     note_col = headers.get("備考")
+    current_before_csv_col = headers.get("現_打鍵前CSVパス") or headers.get("現_打鍵前CSV出处")
+    current_after_csv_col = headers.get("現_打鍵後CSVパス") or headers.get("現_打鍵後CSV出处")
     if not table_col:
         return {}
 
@@ -821,12 +832,23 @@ def collect_existing_summary_notes(wb) -> dict[str, str]:
         if not name:
             continue
         note = ws.cell(r, note_col).value if note_col else ""
-        result[str(name).strip()] = str(note or "")
+        current_before_csv = ws.cell(r, current_before_csv_col).value if current_before_csv_col else ""
+        current_after_csv = ws.cell(r, current_after_csv_col).value if current_after_csv_col else ""
+        result[str(name).strip()] = {
+            "note": str(note or ""),
+            "current_before_csv": str(current_before_csv or ""),
+            "current_after_csv": str(current_after_csv or ""),
+        }
     return result
 
 
-def write_helper_sheet(wb, helper_rows: list[dict]):
+def write_helper_sheet(wb, helper_rows: list[dict], selected_table_names=None):
+    preserved_rows = []
     if HELPER_SHEET_NAME in wb.sheetnames:
+        if selected_table_names is not None:
+            for values in wb[HELPER_SHEET_NAME].iter_rows(min_row=2, max_col=6, values_only=True):
+                if values[0] and not (make_table_aliases(values[0]) & selected_table_names):
+                    preserved_rows.append(values)
         del wb[HELPER_SHEET_NAME]
     ws = wb.create_sheet(HELPER_SHEET_NAME)
     headers = [
@@ -847,6 +869,8 @@ def write_helper_sheet(wb, helper_rows: list[dict]):
             row.get("new_after_csv", ""),
             row.get("note", ""),
         ])
+    for values in preserved_rows:
+        ws.append(values)
 
     for r in range(1, ws.max_row + 1):
         ws.row_dimensions[r].height = HEADER_ROW_HEIGHT if r == 1 else BODY_ROW_HEIGHT
@@ -865,13 +889,8 @@ def write_helper_sheet(wb, helper_rows: list[dict]):
     return ws
 
 
-def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[str, str], helper_names: set[str]):
-    # 既存の summary/テーブル検証は再作成する
-    for name in (SUMMARY_SHEET_NAME, OLD_SUMMARY_SHEET_NAME):
-        if name in wb.sheetnames:
-            del wb[name]
-
-    ws = wb.create_sheet(SUMMARY_SHEET_NAME, 0)
+def _build_validation_data(wb, blocks: list[TableBlock], existing_summary_info: dict[str, dict[str, str]], helper_names: set[str]):
+    ws = wb.create_sheet("_validation_update")
     headers = [
         "CRUD",
         "出力番号",
@@ -883,8 +902,10 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
         "新_打鍵前件数",
         "新_打鍵後件数",
         "新_打鍵前後件数差異",
-        "新_打鍵前CSV出处",
-        "新_打鍵後CSV出处",
+        "現_打鍵前CSVパス",
+        "現_打鍵後CSVパス",
+        "新_打鍵前CSVパス",
+        "新_打鍵後CSVパス",
         "現新件数チェック",
         "差分チェック",
         "備考",
@@ -906,12 +927,13 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
         helper_ref = quote_sheet_name(HELPER_SHEET_NAME)
 
         note_parts = []
-        old_note = existing_notes.get(block.table_name, "")
+        existing_info = existing_summary_info.get(block.table_name, {})
+        old_note = existing_info.get("note", "")
         if old_note:
-            note_parts.append(old_note)
+            note_parts.extend(old_note.split(" / "))
         if block.note:
-            note_parts.append(block.note)
-        note = " / ".join([n for n in note_parts if n])
+            note_parts.extend(block.note.split(" / "))
+        note = " / ".join(dict.fromkeys(n for n in note_parts if n))
 
         ws.cell(row_no, 1).value = f'=IF(AND(E{row_no}=0,F{row_no}=0),"",IF(F{row_no}>E{row_no},"C",IF(F{row_no}<E{row_no},"D","U")))'
         ws.cell(row_no, 2).value = block.output_no if block.output_no is not None else ""
@@ -923,11 +945,13 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
         ws.cell(row_no, 8).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,2,FALSE),0)'
         ws.cell(row_no, 9).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,3,FALSE),0)'
         ws.cell(row_no, 10).value = f"=I{row_no}-H{row_no}"
-        ws.cell(row_no, 11).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,4,FALSE),"")'
-        ws.cell(row_no, 12).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,5,FALSE),"")'
-        ws.cell(row_no, 13).value = f'=IF(AND(E{row_no}=H{row_no},F{row_no}=I{row_no}),"差分なし","差分あり")'
-        ws.cell(row_no, 14).value = f'=IF(COUNTIF({sheet_ref}!B{block.title_row}:B{block.end_row},"差分あり")>0,"NG","OK")'
-        ws.cell(row_no, 15).value = note
+        ws.cell(row_no, 11).value = existing_info.get("current_before_csv", "")
+        ws.cell(row_no, 12).value = existing_info.get("current_after_csv", "")
+        ws.cell(row_no, 13).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,4,FALSE),"")'
+        ws.cell(row_no, 14).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,5,FALSE),"")'
+        ws.cell(row_no, 15).value = f'=IF(AND(E{row_no}=H{row_no},F{row_no}=I{row_no}),"差分なし","差分あり")'
+        ws.cell(row_no, 16).value = f'=IF(COUNTIF({sheet_ref}!B{block.title_row}:B{block.end_row},"差分あり")>0,"NG","OK")'
+        ws.cell(row_no, 17).value = note
 
         current_before = _safe_numeric_formula_source(wb[block.sheet_name].cell(block.before_count_row, 3).value)
         current_after = _safe_numeric_formula_source(wb[block.sheet_name].cell(block.after_count_row, 3).value)
@@ -950,11 +974,13 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
         ws.cell(row_no, 8).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,2,FALSE),0)'
         ws.cell(row_no, 9).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,3,FALSE),0)'
         ws.cell(row_no, 10).value = f"=I{row_no}-H{row_no}"
-        ws.cell(row_no, 11).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,4,FALSE),"")'
-        ws.cell(row_no, 12).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,5,FALSE),"")'
-        ws.cell(row_no, 13).value = f'=IF(AND(E{row_no}=H{row_no},F{row_no}=I{row_no}),"差分なし","差分あり")'
-        ws.cell(row_no, 14).value = ""
-        ws.cell(row_no, 15).value = note
+        ws.cell(row_no, 11).value = ""
+        ws.cell(row_no, 12).value = ""
+        ws.cell(row_no, 13).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,4,FALSE),"")'
+        ws.cell(row_no, 14).value = f'=IFERROR(VLOOKUP(D{row_no},{helper_ref}!$A:$F,5,FALSE),"")'
+        ws.cell(row_no, 15).value = f'=IF(AND(E{row_no}=H{row_no},F{row_no}=I{row_no}),"差分なし","差分あり")'
+        ws.cell(row_no, 16).value = ""
+        ws.cell(row_no, 17).value = note
         row_no += 1
 
     max_row = max(1, ws.max_row)
@@ -966,7 +992,7 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
             force_font_name(cell)
             cell.border = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
             if r > 1:
-                cell.alignment = Alignment(vertical="center", wrap_text=(c in {11, 12, 15}))
+                cell.alignment = Alignment(vertical="center", wrap_text=(c in {11, 12, 13, 14, 17}))
 
     # 行背景は数式結果が未計算でも見やすいように出力時点の現件数で軽く分類する
     for r in range(2, max_row + 1):
@@ -977,8 +1003,8 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
             ws.cell(r, c).fill = copy(fill)
 
     if max_row >= 2:
-        count_check_ref = f"M2:M{max_row}"
-        data_check_ref = f"N2:N{max_row}"
+        count_check_ref = f"O2:O{max_row}"
+        data_check_ref = f"P2:P{max_row}"
         ws.conditional_formatting.add(count_check_ref, CellIsRule(operator="equal", formula=['"差分なし"'], fill=TRUE_FILL))
         ws.conditional_formatting.add(count_check_ref, CellIsRule(operator="equal", formula=['"差分あり"'], fill=FALSE_FILL, font=FALSE_FONT))
         ws.conditional_formatting.add(data_check_ref, CellIsRule(operator="equal", formula=['"OK"'], fill=TRUE_FILL))
@@ -986,9 +1012,103 @@ def write_validation_sheet(wb, blocks: list[TableBlock], existing_notes: dict[st
 
     ws.auto_filter.ref = f"A1:{get_column_letter(max_col)}{max_row}"
     ws.freeze_panes = "A2"
-    widths = [10, 12, 16, 32, 18, 18, 22, 18, 18, 22, 45, 45, 18, 18, 75]
+    widths = [10, 12, 16, 32, 18, 18, 22, 18, 18, 22, 45, 45, 45, 45, 18, 18, 75]
     for i, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
+    return ws
+
+
+def write_validation_sheet(wb, blocks: list[TableBlock], existing_summary_info: dict[str, dict[str, str]], helper_names: set[str]):
+    ws = next((wb[name] for name in (SUMMARY_SHEET_NAME, OLD_SUMMARY_SHEET_NAME)
+               if name in wb.sheetnames), None)
+    data = _build_validation_data(wb, blocks, existing_summary_info, helper_names)
+    if ws is None:
+        data.title = SUMMARY_SHEET_NAME
+        wb.move_sheet(data, offset=-wb.index(data))
+        return data
+
+    if ws.cell(1, 13).value != "新_打鍵前CSVパス":
+        old_max_col = ws.max_column
+        # openpyxl inserts cells but does not move dimensions or formatting ranges.
+        dimensions = {c: copy(ws.column_dimensions[get_column_letter(c)])
+                      for c in range(13, old_max_col + 1)}
+        merges = [copy(area) for area in ws.merged_cells.ranges]
+        for area in merges:
+            ws.unmerge_cells(str(area))
+        rules = [(copy(cf), list(cf_rules))
+                 for cf, cf_rules in ws.conditional_formatting._cf_rules.items()]
+        ws.conditional_formatting._cf_rules.clear()
+        ws.insert_cols(13, 2)
+        for c, dimension in dimensions.items():
+            letter = get_column_letter(c + 2)
+            dimension.index = letter
+            dimension.min = dimension.max = c + 2
+            ws.column_dimensions[letter] = dimension
+        for area in merges:
+            if area.min_col >= 13:
+                area.shift(col_shift=2)
+            elif area.max_col >= 13:
+                area.max_col += 2
+            ws.merge_cells(str(area))
+        for cf, cf_rules in rules:
+            for area in cf.sqref.ranges:
+                if area.min_col >= 13:
+                    area.shift(col_shift=2)
+                elif area.max_col >= 13:
+                    area.max_col += 2
+            for rule in cf_rules:
+                ws.conditional_formatting.add(str(cf.sqref), rule)
+        for target, source in ((13, 11), (14, 12)):
+            letter = get_column_letter(target)
+            dimension = copy(ws.column_dimensions[get_column_letter(source)])
+            dimension.index = letter
+            dimension.min = dimension.max = target
+            ws.column_dimensions[letter] = dimension
+            for r in range(1, ws.max_row + 1):
+                ws.cell(r, target)._style = copy(ws.cell(r, source)._style)
+        if ws.auto_filter.ref:
+            from openpyxl.worksheet.cell_range import CellRange
+            area = CellRange(ws.auto_filter.ref)
+            area.max_col += 2
+            ws.auto_filter.ref = str(area)
+            for column in ws.auto_filter.filterColumn:
+                if column.colId >= 12:
+                    column.colId += 2
+
+    for c in (11, 12, 13, 14):
+        ws.cell(1, c).value = data.cell(1, c).value
+    existing_rows = {str(ws.cell(r, 4).value).strip().lower(): r
+                     for r in range(2, ws.max_row + 1) if ws.cell(r, 4).value}
+    for source_row in range(2, data.max_row + 1):
+        key = str(data.cell(source_row, 4).value).strip().lower()
+        target_row = existing_rows.get(key)
+        if target_row is None:
+            target_row = ws.max_row + 1
+            for c in range(1, 18):
+                ws.cell(target_row, c)._style = copy(ws.cell(target_row - 1, c)._style)
+            ws.row_dimensions[target_row].height = ws.row_dimensions[target_row - 1].height
+            columns = range(1, 18)
+        else:
+            columns = (8, 9, 10, 13, 14, 15, 17)
+        for c in columns:
+            value = data.cell(source_row, c).value
+            if isinstance(value, str) and value.startswith("="):
+                from openpyxl.formula import Tokenizer
+                from openpyxl.formula.translate import Translator
+                tokens = Tokenizer(value).items
+                for token in tokens:
+                    if token.subtype == "RANGE" and "!" not in token.value:
+                        token.value = Translator("=" + token.value,
+                                                 origin=data.cell(source_row, c).coordinate).translate_formula(
+                                                     ws.cell(target_row, c).coordinate)[1:]
+                value = "=" + "".join(token.value for token in tokens)
+            ws.cell(target_row, c).value = value
+    if ws.auto_filter.ref:
+        from openpyxl.worksheet.cell_range import CellRange
+        area = CellRange(ws.auto_filter.ref)
+        area.max_row = max(area.max_row, ws.max_row)
+        ws.auto_filter.ref = str(area)
+    wb.remove(data)
     return ws
 
 
@@ -1000,7 +1120,7 @@ def _safe_numeric_formula_source(value):
 
 # ------------------------- メイン処理 -------------------------
 
-def make_helper_rows(blocks: list[TableBlock], before_map: dict[str, Path], after_map: dict[str, Path], fill_results: dict[str, FillResult]):
+def make_helper_rows(blocks: list[TableBlock], before_map: dict[str, Path], after_map: dict[str, Path], fill_results: dict[str, FillResult], selected_table_names=None):
     rows = []
     names = {b.table_name for b in blocks}
     # 新CSVだけ存在するものも追加
@@ -1014,6 +1134,8 @@ def make_helper_rows(blocks: list[TableBlock], before_map: dict[str, Path], afte
         names.add(path.stem)
 
     for name in sorted(names, key=lambda x: x.lower()):
+        if selected_table_names is not None and not (make_table_aliases(name) & selected_table_names):
+            continue
         res = fill_results.get(name.lower())
         before_info = res.before_info if res else read_csv_info(find_csv(before_map, name))
         after_info = res.after_info if res else read_csv_info(find_csv(after_map, name))
@@ -1603,12 +1725,12 @@ def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path,
     wb = load_workbook(workbook_path)
     if not compare_exclusions:
         compare_exclusions = read_compare_exclusions(wb)
-    existing_notes = collect_existing_summary_notes(wb)
+    existing_summary_info = collect_existing_summary_info(wb)
     blocks = discover_table_blocks(wb, table_sheet_prefix)
+    if not blocks:
+        raise RuntimeError("テーブル明細ブロックが見つかりません。先に old_fill_csv_to_excel.py を実行し、シート名・タイトル行を確認してください。")
     if selected_table_names is not None:
         blocks = [block for block in blocks if block_matches_selected_tables(block, selected_table_names)]
-    if not blocks:
-        raise RuntimeError("テーブル明細ブロックが見つかりません。シート名・タイトル行を確認してください。")
 
     condition_write_count = write_extraction_conditions_for_blocks(wb, blocks, selected_table_conditions or {})
 
@@ -1651,14 +1773,15 @@ def fill_workbook(workbook_path: Path, before_dir, after_dir, output_path: Path,
         add_standard_compare_cf(ws, block.after_compare_start, block.after_compare_end, block.data_last_col)
         for s, e in block.cross_ranges:
             add_standard_compare_cf(ws, s, e, block.data_last_col)
+        trim_text_cells(ws, max(block.data_last_col, ws.max_column))
         normalize_rows_and_fonts(ws, max(block.data_last_col, ws.max_column))
 
-    helper_rows = make_helper_rows(blocks, before_map, after_map, fill_results)
-    write_helper_sheet(wb, helper_rows)
+    helper_rows = make_helper_rows(blocks, before_map, after_map, fill_results, selected_table_names)
+    write_helper_sheet(wb, helper_rows, selected_table_names)
     helper_names = {row["table_name"].lower() for row in helper_rows}
-    write_validation_sheet(wb, blocks, existing_notes, helper_names)
+    write_validation_sheet(wb, blocks, existing_summary_info, helper_names)
 
-    auto_fit_column_widths(wb, enabled=auto_width, max_width=max_width, min_width=min_width, sheet_names=[ws.title for ws in wb.worksheets if is_table_sheet_name(ws.title, table_sheet_prefix) or ws.title in {SUMMARY_SHEET_NAME, HELPER_SHEET_NAME}])
+    auto_fit_column_widths(wb, enabled=auto_width, max_width=max_width, min_width=min_width, sheet_names=[ws.title for ws in wb.worksheets if (is_table_sheet_name(ws.title, table_sheet_prefix) or ws.title == HELPER_SHEET_NAME) and ws.title not in {SUMMARY_SHEET_NAME, OLD_SUMMARY_SHEET_NAME}])
 
     mismatch_count = None
     if selector_info:
